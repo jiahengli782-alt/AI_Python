@@ -41,6 +41,17 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+interface TreeEditSnapshot {
+  editingStepId: string | null;
+  editedOutput: string;
+  editedSystemPrompt: string;
+  editedUserTemplate: string;
+  editedInput: string;
+  selectedStepId: string | null;
+  treePromptDrafts: Record<string, string>;
+  subprocesses: Subprocess[];
+}
+
 function formatJsonToChinese(text: string): string {
   if (!text) return '';
 
@@ -133,8 +144,11 @@ export default function App() {
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [treePromptDrafts, setTreePromptDrafts] = useState<Record<string, string>>({});
   const [treePreviewResults, setTreePreviewResults] = useState<TreePreviewResult[]>([]);
+  const [treePreviewFinalOutput, setTreePreviewFinalOutput] = useState('');
+  const [treeEditSnapshot, setTreeEditSnapshot] = useState<TreeEditSnapshot | null>(null);
   const [isTreePreviewing, setIsTreePreviewing] = useState(false);
   const [treeResetSignal, setTreeResetSignal] = useState(0);
+  const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
   const [modificationHistory, setModificationHistory] = useState<{
     round: number;
     modifiedStepIndex: number;
@@ -144,6 +158,7 @@ export default function App() {
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const stepCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const treeEditSnapshotRef = useRef<TreeEditSnapshot | null>(null);
 
   const streamSolve = async (payload: {
     question: string;
@@ -151,6 +166,7 @@ export default function App() {
     modifiedOutputs?: Record<string, string>;
     modifiedSteps?: Record<string, any>;
     baseStages?: Subprocess[];
+    previewMode?: boolean;
   }) => {
     const params = new URLSearchParams({ question: payload.question });
 
@@ -170,22 +186,32 @@ export default function App() {
       params.set('useSessionBase', '1');
     }
 
+    if (payload.previewMode) {
+      params.set('previewMode', '1');
+    }
+
+    const postStream = () => fetch('http://localhost:8000/api/solve/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (payload.baseStages?.length) {
+      return postStream();
+    }
+
     const getUrl = `http://localhost:8000/api/solve/stream?${params.toString()}`;
 
     try {
       const getResponse = await fetch(getUrl);
-      if (getResponse.status !== 414 && getResponse.status !== 431) {
+      if (getResponse.status !== 414 && getResponse.status !== 431 && getResponse.status !== 405) {
         return getResponse;
       }
     } catch {
       // 如果短 GET 仍被浏览器或代理拒绝，再尝试 POST body。
     }
 
-    return fetch('http://localhost:8000/api/solve/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    return postStream();
   };
 
   const getEditableUserTemplate = (step: Subprocess) =>
@@ -206,10 +232,102 @@ export default function App() {
     ].join('\n');
   };
 
+  const mergeTreePromptIntoUserTemplate = (userTemplate: string, shortPrompt: string) => {
+    const cleanedBase = (userTemplate || '')
+      .replace(/【树状图摘要Prompt】[\s\S]*?(?:\n\s*\n|$)/, '')
+      .trim();
+
+    return [
+      treePromptMarker,
+      shortPrompt.trim(),
+      '',
+      cleanedBase || '问题：{question}\n\n已知：\n{previous_output}\n\n请根据摘要Prompt生成该子过程的结构化结果。',
+    ].join('\n');
+  };
+
   const summarizeForPreview = (text: string, maxLength = 80) => {
     const clean = (text || '').replace(/\s+/g, ' ').trim();
     if (!clean) return '暂无可预览结果';
     return clean.length > maxLength ? `${clean.slice(0, maxLength)}...` : clean;
+  };
+
+  const formatApiErrorMessage = (message = '') => {
+    if (/429|SetLimitExceeded|quota|limit/i.test(message)) {
+      return '豆包 API 额度或限流已触发，请检查火山方舟账户额度/限额后再试。已停止后续步骤，避免把失败结果写入版本。';
+    }
+    return message || 'API 调用失败';
+  };
+
+  const compactForPreviewPayload = (text = '', maxLength = 1200) => {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    if (clean.length <= maxLength) return clean;
+    return `${clean.slice(0, Math.floor(maxLength * 0.6))}\n...\n${clean.slice(-Math.floor(maxLength * 0.3))}`;
+  };
+
+  const buildPreviewBaseStages = (stages: Subprocess[]) =>
+    stages.map(stage => ({
+      ...stage,
+      input: compactForPreviewPayload(stage.input, 700),
+      output: compactForPreviewPayload(stage.output, 900),
+      systemPrompt: compactForPreviewPayload(stage.systemPrompt || '', 1100),
+      userPrompt: compactForPreviewPayload(stage.userPrompt || '', 700),
+      userPromptTemplate: compactForPreviewPayload(stage.userPromptTemplate || '', 700),
+    }));
+
+  const extractSummaryText = (text: string) => {
+    const raw = (text || '').trim();
+    if (!raw) return '';
+
+    try {
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+      const meaningful = (value: string) => {
+        const clean = value.replace(/\s+/g, ' ').trim();
+        return clean.length >= 8 && !/^\d+[\.\)、)]?$/.test(clean);
+      };
+      const bestText = (items: string[]) =>
+        items
+          .map(item => item.replace(/\s+/g, ' ').trim())
+          .filter(meaningful)
+          .sort((a, b) => b.length - a.length)[0] || '';
+      const findText = (value: any): string => {
+        if (!value) return '';
+        if (typeof value === 'string') return meaningful(value) ? value : '';
+        if (Array.isArray(value)) return bestText(value.map(findText).filter(Boolean));
+        if (typeof value === 'object') {
+          const keys = ['summary', 'result', 'answer', 'final', 'conclusion', 'output', 'content', '核心', '结果', '答案'];
+          for (const key of keys) {
+            const found = findText(value[key]);
+            if (found) return found;
+          }
+          return bestText(Object.values(value).map(findText).filter(Boolean));
+        }
+        return String(value);
+      };
+      const extracted = findText(parsed);
+      if (extracted) return extracted;
+    } catch {
+      // 非JSON输出直接进入文本摘要。
+    }
+
+    return raw
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/[{}\[\]"`*_#>|]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  const summarizeTreeNode = (text: string, maxLength = 32) => {
+    const extracted = extractSummaryText(text)
+      .replace(/[#*_`>]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const firstMeaningful = extracted
+      .split(/[。；;.!?？\n]/)
+      .map(item => item.replace(/^#+\s*/, '').trim())
+      .find(item => item.length >= 8 && !/^\d+[\.\)、)]?$/.test(item));
+    const clean = (firstMeaningful || extracted || '暂无可预览结果').trim();
+    return clean.length > maxLength ? clean.slice(0, maxLength) : clean;
   };
 
   const readSSEComplete = async (reader: ReadableStreamDefaultReader) => {
@@ -236,12 +354,39 @@ export default function App() {
         }
       }
 
-      if (eventType === 'complete' && eventData) {
-        return JSON.parse(eventData);
+      if (eventData) {
+        const data = JSON.parse(eventData);
+        if (eventType === 'api_error') {
+          throw new Error(formatApiErrorMessage(data.error));
+        }
+        if (eventType === 'complete') {
+          return data;
+        }
       }
     }
 
     throw new Error('试运行没有返回完整结果');
+  };
+
+  const rememberTreeSnapshot = () => {
+    if (treeEditSnapshotRef.current) return;
+    const snapshot: TreeEditSnapshot = {
+      editingStepId,
+      editedOutput,
+      editedSystemPrompt,
+      editedUserTemplate,
+      editedInput,
+      selectedStepId,
+      treePromptDrafts: { ...treePromptDrafts },
+      subprocesses: subprocesses.map(step => ({ ...step })),
+    };
+    treeEditSnapshotRef.current = snapshot;
+    setTreeEditSnapshot(snapshot);
+  };
+
+  const clearTreeSnapshot = () => {
+    treeEditSnapshotRef.current = null;
+    setTreeEditSnapshot(null);
   };
 
   const runTreePreview = async (stepId: string, prompt: string, source: 'current' | 'suggestion') => {
@@ -259,6 +404,10 @@ export default function App() {
         editingStepId === stepId ? editedSystemPrompt : (targetStep.systemPrompt || ''),
         source === 'suggestion' ? `试运行AI建议方向：${prompt}` : prompt
       );
+      const previewUserTemplate = mergeTreePromptIntoUserTemplate(
+        editingStepId === stepId ? editedUserTemplate : getEditableUserTemplate(targetStep),
+        source === 'suggestion' ? `试运行AI建议方向：${prompt}` : prompt
+      );
 
       const response = await streamSolve({
         question: userQuestion,
@@ -266,9 +415,11 @@ export default function App() {
         modifiedSteps: {
           [targetStep.id]: {
             systemPrompt: previewSystemPrompt,
+            userPromptTemplate: previewUserTemplate,
           },
         },
-        baseStages: subprocesses,
+        baseStages: buildPreviewBaseStages(subprocesses),
+        previewMode: true,
       });
 
       if (!response.ok) throw new Error(`试运行失败: ${response.status}`);
@@ -278,10 +429,11 @@ export default function App() {
       const data = await readSSEComplete(reader);
       const returnedStages: Subprocess[] = data.stages || [];
       const previewStages: Subprocess[] =
-        returnedStages.length < subprocesses.length
-          ? [...subprocesses.slice(0, targetIndex), ...returnedStages]
-          : returnedStages;
+        returnedStages.length >= subprocesses.length
+          ? [...subprocesses.slice(0, targetIndex), ...returnedStages.slice(targetIndex)]
+          : [...subprocesses.slice(0, targetIndex), ...returnedStages];
 
+      rememberTreeSnapshot();
       setTreePreviewResults(subprocesses.map((step, index): TreePreviewResult => {
         const previewStage = previewStages[index] || step;
 
@@ -290,17 +442,23 @@ export default function App() {
             stepId: step.id,
             name: step.name,
             status: 'unchanged',
-            summary: summarizeForPreview(step.output || step.description, 86),
+            summary: summarizeTreeNode(step.output || step.description, 18),
+            fullResult: formatJsonToChinese(step.output || step.description || ''),
           };
         }
 
+        const fullResult = formatJsonToChinese(previewStage.output || previewStage.description || prompt);
         return {
           stepId: step.id,
           name: previewStage.name || step.name,
           status: index === targetIndex ? 'changed' : 'affected',
-          summary: summarizeForPreview(previewStage.output || previewStage.description || prompt, 110),
+          summary: summarizeTreeNode(previewStage.output || previewStage.description || prompt, 20),
+          fullResult,
         };
       }));
+      setTreePreviewFinalOutput(formatJsonToChinese(data.finalOutputFull || data.finalOutput || previewStages[previewStages.length - 1]?.output || ''));
+      setSelectedStepId(targetStep.id);
+      setTreePromptDrafts(prev => ({ ...prev, [targetStep.id]: prompt }));
     } catch (err: any) {
       console.error('树状图试运行失败:', err);
       setError(err.message || '树状图试运行失败');
@@ -310,7 +468,20 @@ export default function App() {
   };
 
   const undoTreePreview = () => {
+    const snapshot = treeEditSnapshotRef.current || treeEditSnapshot;
     setTreePreviewResults([]);
+    setTreePreviewFinalOutput('');
+    if (snapshot) {
+      setSubprocesses(snapshot.subprocesses.map(step => ({ ...step })));
+      setEditingStepId(snapshot.editingStepId);
+      setEditedOutput(snapshot.editedOutput);
+      setEditedSystemPrompt(snapshot.editedSystemPrompt);
+      setEditedUserTemplate(snapshot.editedUserTemplate);
+      setEditedInput(snapshot.editedInput);
+      setSelectedStepId(snapshot.selectedStepId);
+      setTreePromptDrafts({ ...snapshot.treePromptDrafts });
+      clearTreeSnapshot();
+    }
     setTreeResetSignal(prev => prev + 1);
   };
 
@@ -318,23 +489,33 @@ export default function App() {
     const step = subprocesses.find(item => item.id === stepId);
     if (!step) return;
 
+    rememberTreeSnapshot();
     setSelectedStepId(stepId);
     setTreePromptDrafts(prev => ({ ...prev, [stepId]: prompt }));
     setEditingStepId(stepId);
     setEditedOutput(step.output || '');
     setEditedInput(step.input || '');
-    setEditedUserTemplate(getEditableUserTemplate(step));
+    const promptForAdoption = source === 'suggestion' ? `采纳AI建议方向：${prompt}` : prompt;
+    setEditedUserTemplate(mergeTreePromptIntoUserTemplate(
+      editingStepId === stepId ? editedUserTemplate : getEditableUserTemplate(step),
+      promptForAdoption
+    ));
     setEditedSystemPrompt(mergeTreePromptIntoSystemPrompt(
       editingStepId === stepId ? editedSystemPrompt : (step.systemPrompt || ''),
-      source === 'suggestion' ? `采纳AI建议方向：${prompt}` : prompt
+      promptForAdoption
     ));
   };
 
-  const hasEditChanges = (step: Subprocess) =>
-    editedSystemPrompt !== (step.systemPrompt || '') ||
-    editedUserTemplate !== getEditableUserTemplate(step) ||
-    editedInput !== (step.input || '') ||
-    editedOutput !== (step.output || '');
+  const getCommitBaseStep = (step: Subprocess) =>
+    treeEditSnapshotRef.current?.subprocesses.find(item => item.id === step.id) || step;
+
+  const hasEditChanges = (step: Subprocess) => {
+    const baseStep = getCommitBaseStep(step);
+    return editedSystemPrompt !== (baseStep.systemPrompt || '') ||
+      editedUserTemplate !== getEditableUserTemplate(baseStep) ||
+      editedInput !== (baseStep.input || '') ||
+      editedOutput !== (baseStep.output || '');
+  };
 
   const buildMetricTitle = (step: Subprocess) => {
     const basis = step.metricBasis;
@@ -457,6 +638,10 @@ export default function App() {
       try {
         const data = JSON.parse(eventData);
 
+        if (eventType === 'api_error') {
+          throw new Error(formatApiErrorMessage(data.error));
+        }
+
         if (eventType === 'stage_complete' && data.stage) {
           setSubprocesses(prev => {
             const idx = prev.findIndex(s => s.id === data.stage.id);
@@ -495,6 +680,9 @@ export default function App() {
           return;
         }
       } catch (err) {
+        if (eventType === 'api_error') {
+          throw err;
+        }
         console.error('解析事件数据失败:', err);
       }
     }
@@ -540,6 +728,8 @@ export default function App() {
     setModificationHistory([]);
     setTreePromptDrafts({});
     setTreePreviewResults([]);
+    setTreePreviewFinalOutput('');
+    clearTreeSnapshot();
     setTreeResetSignal(prev => prev + 1);
 
     try {
@@ -566,7 +756,8 @@ export default function App() {
 
   const confirmStepModification = async (stepIndex: number) => {
     const userQuestion = activeQuestion || chatMessages.find(m => m.role === 'user')?.content;
-    const targetStep = subprocesses[stepIndex];
+    const commitBaseStages = treeEditSnapshotRef.current?.subprocesses || subprocesses;
+    const targetStep = commitBaseStages[stepIndex] || subprocesses[stepIndex];
     if (!userQuestion || !targetStep || isLoading) return;
 
     setIsLoading(true);
@@ -600,7 +791,7 @@ export default function App() {
         startStepIndex: stepIndex,
         modifiedOutputs,
         modifiedSteps,
-        baseStages: subprocesses,
+        baseStages: commitBaseStages,
       });
       if (!response.ok) throw new Error(`请求失败: ${response.status}`);
 
@@ -609,7 +800,10 @@ export default function App() {
 
       await parseSSEResponse(reader, stepIndex);
 
+      setTreePromptDrafts({});
       setTreePreviewResults([]);
+      setTreePreviewFinalOutput('');
+      clearTreeSnapshot();
       setTreeResetSignal(prev => prev + 1);
       setEditingStepId(null);
       setEditedOutput('');
@@ -640,7 +834,11 @@ export default function App() {
     // 将该round的stages加载到subprocesses显示
     setSubprocesses(record.stages);
     setSelectedStepId(null);
+    setTreePromptDrafts({});
     setTreePreviewResults([]);
+    setTreePreviewFinalOutput('');
+    clearTreeSnapshot();
+    setTreeResetSignal(prev => prev + 1);
   };
 
   const cancelEdit = () => {
@@ -656,12 +854,24 @@ export default function App() {
     setSubprocesses([]);
     setEditingStepId(null);
     setSelectedStepId(null);
+    setExpandedStepId(null);
     setModificationHistory([]);
     setActiveQuestion('');
     setTreePromptDrafts({});
     setTreePreviewResults([]);
+    setTreePreviewFinalOutput('');
+    clearTreeSnapshot();
     setTreeResetSignal(prev => prev + 1);
   };
+
+  const expandedStep = expandedStepId
+    ? subprocesses.find(step => step.id === expandedStepId) || null
+    : null;
+  const expandedStepIsEditing = expandedStep?.id === editingStepId;
+  const expandedSystemPrompt = expandedStepIsEditing ? editedSystemPrompt : (expandedStep?.systemPrompt || '');
+  const expandedUserTemplate = expandedStepIsEditing ? editedUserTemplate : (expandedStep ? getEditableUserTemplate(expandedStep) : '');
+  const expandedInput = expandedStepIsEditing ? editedInput : (expandedStep?.input || '');
+  const expandedOutput = expandedStepIsEditing ? editedOutput : (expandedStep?.output || '');
 
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-slate-50 to-sky-50">
@@ -707,6 +917,8 @@ export default function App() {
                 editedSystemPrompt={editedSystemPrompt}
                 promptDrafts={treePromptDrafts}
                 previewResults={treePreviewResults}
+                previewFinalOutput={treePreviewFinalOutput}
+                canUndoTreeChange={Boolean(treeEditSnapshot)}
                 isPreviewing={isTreePreviewing}
                 resetSignal={treeResetSignal}
                 onSelectStep={setSelectedStepId}
@@ -806,15 +1018,30 @@ export default function App() {
                               </span>
                             )}
                             {isEditable && (
-                              <button
-                                onClick={() => isEditing ? cancelEdit() : openEdit(sub)}
-                                className="p-0.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600"
-                                title={isEditing ? "取消编辑" : "编辑"}
-                              >
-                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                                </svg>
-                              </button>
+                              <>
+                                <button
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setExpandedStepId(sub.id);
+                                  }}
+                                  className="px-1.5 py-0.5 rounded border border-slate-200 bg-white text-[11px] text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+                                  title="放大查看"
+                                >
+                                  查看
+                                </button>
+                                <button
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    isEditing ? cancelEdit() : openEdit(sub);
+                                  }}
+                                  className="p-0.5 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-600"
+                                  title={isEditing ? "取消编辑" : "编辑"}
+                                >
+                                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                  </svg>
+                                </button>
+                              </>
                             )}
                           </div>
                         </div>
@@ -1044,6 +1271,45 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {expandedStep && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 px-6 py-8">
+          <div className="flex max-h-full w-full max-w-6xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-800">
+                  STEP {expandedStep.order || subprocesses.findIndex(step => step.id === expandedStep.id) + 1}: {expandedStep.name}
+                </div>
+                <div className="mt-0.5 text-[11px] text-slate-400">决策子过程完整内容，可滚动查看</div>
+              </div>
+              <button
+                onClick={() => setExpandedStepId(null)}
+                className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+              >
+                关闭
+              </button>
+            </div>
+            <div className="grid max-h-[76vh] grid-cols-2 gap-4 overflow-y-auto p-5 text-sm">
+              <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="mb-2 text-xs font-semibold text-slate-500">Input</div>
+                <pre className="whitespace-pre-wrap font-sans leading-6 text-slate-700">{expandedInput || '（无）'}</pre>
+              </section>
+              <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="mb-2 text-xs font-semibold text-slate-500">Output</div>
+                <pre className="whitespace-pre-wrap font-sans leading-6 text-slate-700">{formatJsonToChinese(expandedOutput) || '（无）'}</pre>
+              </section>
+              <section className="rounded-lg border border-purple-100 bg-purple-50/60 p-3">
+                <div className="mb-2 text-xs font-semibold text-purple-600">System Prompt</div>
+                <pre className="whitespace-pre-wrap font-sans leading-6 text-slate-700">{expandedSystemPrompt || '（无）'}</pre>
+              </section>
+              <section className="rounded-lg border border-purple-100 bg-purple-50/60 p-3">
+                <div className="mb-2 text-xs font-semibold text-purple-600">User Template</div>
+                <pre className="whitespace-pre-wrap font-sans leading-6 text-slate-700">{expandedUserTemplate || '（无）'}</pre>
+              </section>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

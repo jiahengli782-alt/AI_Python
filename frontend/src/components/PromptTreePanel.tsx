@@ -21,6 +21,7 @@ export interface TreePreviewResult {
   name: string;
   status: 'unchanged' | 'changed' | 'affected';
   summary: string;
+  fullResult?: string;
 }
 
 interface TreeSuggestion {
@@ -35,6 +36,10 @@ type EditingTarget =
   | { type: 'current'; stepId: string }
   | { type: 'suggestion'; stepId: string; suggestionId: string };
 
+type DetailTarget =
+  | EditingTarget
+  | { type: 'final' };
+
 interface PromptTreePanelProps {
   goal: string;
   subprocesses: Subprocess[];
@@ -43,6 +48,8 @@ interface PromptTreePanelProps {
   editedSystemPrompt: string;
   promptDrafts: Record<string, string>;
   previewResults: TreePreviewResult[];
+  previewFinalOutput: string;
+  canUndoTreeChange: boolean;
   isPreviewing: boolean;
   resetSignal: number;
   onSelectStep: (stepId: string) => void;
@@ -55,8 +62,18 @@ const marker = '【树状图摘要Prompt】';
 
 function compactText(text: string, maxLength = 74) {
   const clean = (text || '').replace(/\s+/g, ' ').trim();
-  if (!clean) return '等待生成子过程后显示摘要 Prompt';
+  if (!clean) return '等待生成结果摘要';
   return clean.length > maxLength ? `${clean.slice(0, maxLength)}...` : clean;
+}
+
+function compactResult(text: string, maxLength = 24) {
+  const clean = (text || '')
+    .replace(/[#*_`>]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const firstClause = clean.split(/[。；;.!?？\n]/).find(Boolean) || clean;
+  const meaningful = /^\d+[\.\)、)]?$/.test(firstClause) ? clean : firstClause;
+  return meaningful.length > maxLength ? meaningful.slice(0, maxLength) : meaningful;
 }
 
 function extractTreePrompt(text: string) {
@@ -71,20 +88,22 @@ function extractTreePrompt(text: string) {
 
 function buildStepSuggestions(step: Subprocess, index: number): TreeSuggestion[] {
   const base = step.name || `步骤${index + 1}`;
+  const resultSeed = compactResult(step.output || step.description || step.input || base, 18);
+  const sourceHint = compactResult(step.description || step.input || base, 18);
   return [
     {
-      id: `${step.id}-verify`,
+      id: `${step.id}-popular-next`,
       stepId: step.id,
-      title: '验证分支',
-      summary: `补充 ${base} 的反例、边界条件和可靠性检查`,
-      prompt: `在“${base}”中加入验证分支：检查关键假设、反例、边界条件，并明确哪些结论需要降低置信度。`,
+      title: '常见追问结果',
+      summary: `可能输出：把“${resultSeed}”转成用户最常追问的下一步清单`,
+      prompt: `在“${base}”中模拟用户看到“${resultSeed}”后最可能继续追问的方向，输出3个高频追问点、每个追问点的简短回答，以及它们对后续步骤的影响。`,
     },
     {
-      id: `${step.id}-evidence`,
+      id: `${step.id}-alternative-plan`,
       stepId: step.id,
-      title: '依据分支',
-      summary: `让 ${base} 显式列出证据、约束和可追溯依据`,
-      prompt: `在“${base}”中加入依据分支：先列出输入证据和约束，再基于证据生成结论，避免跳步推理。`,
+      title: '替代方案结果',
+      summary: `可能输出：围绕“${sourceHint}”给出另一条可执行方案`,
+      prompt: `在“${base}”中不要沿用当前结论，而是基于“${sourceHint}”生成一个可替代的解决方向：说明适用场景、关键步骤、预期结果和主要风险。`,
     },
   ];
 }
@@ -97,6 +116,8 @@ export function PromptTreePanel({
   editedSystemPrompt,
   promptDrafts,
   previewResults,
+  previewFinalOutput,
+  canUndoTreeChange,
   isPreviewing,
   resetSignal,
   onSelectStep,
@@ -105,6 +126,9 @@ export function PromptTreePanel({
   onUndoPreview,
 }: PromptTreePanelProps) {
   const [editingTarget, setEditingTarget] = useState<EditingTarget | null>(null);
+  const [resultDetail, setResultDetail] = useState<{ title: string; content: string } | null>(null);
+  const [detailTarget, setDetailTarget] = useState<DetailTarget | null>(null);
+  const [isDetailExpanded, setIsDetailExpanded] = useState(false);
   const [draftPrompt, setDraftPrompt] = useState('');
   const [zoom, setZoom] = useState(0.92);
   const suggestionsByStep = useMemo(() => {
@@ -117,22 +141,24 @@ export function PromptTreePanel({
 
   const selectedStep = subprocesses.find(step => step.id === selectedStepId);
   const firstStep = subprocesses[0];
-  const goalSuggestions: TreeSuggestion[] = firstStep ? [
-    {
-      id: `${firstStep.id}-goal-user`,
-      stepId: firstStep.id,
-      title: '用户目标方向',
-      summary: '优先澄清用户、场景、成功标准，再展开推理',
-      prompt: `在“${firstStep.name}”中优先澄清目标用户、使用场景、成功标准和限制条件，再决定后续推理路径。`,
-    },
-    {
-      id: `${firstStep.id}-goal-constraint`,
-      stepId: firstStep.id,
-      title: '约束校准方向',
-      summary: '先列出约束、风险和不可做事项，减少方向漂移',
-      prompt: `在“${firstStep.name}”中先列出硬性约束、潜在风险和不应采用的方向，再输出可执行的子过程目标。`,
-    },
-  ] : [];
+  const goalSuggestions: TreeSuggestion[] = useMemo(() => firstStep ? [
+      {
+        id: `${firstStep.id}-goal-user`,
+        stepId: firstStep.id,
+        title: '高频用户问题',
+        summary: `可能输出：围绕“${compactResult(goal, 16)}”拆出最多人会问的3个问题`,
+        prompt: `围绕目标“${goal}”，先预测真实用户最可能追问的3个高频问题，再把这些问题转成后续推理必须覆盖的目标。`,
+      },
+      {
+        id: `${firstStep.id}-goal-constraint`,
+        stepId: firstStep.id,
+        title: '现实约束结果',
+        summary: `可能输出：先得到“${compactResult(goal, 16)}”最关键的限制条件`,
+        prompt: `围绕目标“${goal}”，优先输出真实使用中最可能限制结果质量的约束、风险、资源条件和不可做事项，再决定后续步骤。`,
+      },
+    ] : [],
+    [firstStep, goal]
+  );
 
   const changeZoom = (delta: number) => {
     setZoom(prev => Math.max(0.68, Math.min(1.35, Number((prev + delta).toFixed(2)))));
@@ -144,21 +170,52 @@ export function PromptTreePanel({
     return extractTreePrompt(step.systemPrompt || step.description || step.input);
   };
 
-  const openCurrentStep = (step: Subprocess) => {
+  const getStepResultSummary = (step: Subprocess) =>
+    compactResult(step.output || step.description || step.input || '等待该步骤产生结果', 22);
+
+  const getStepFullResult = (step: Subprocess) =>
+    step.output || step.description || step.input || '该步骤还没有完整结果';
+
+  const openCurrentStep = (step: Subprocess, preview?: TreePreviewResult) => {
     onSelectStep(step.id);
     setEditingTarget({ type: 'current', stepId: step.id });
+    setDetailTarget({ type: 'current', stepId: step.id });
     setDraftPrompt(getCurrentPrompt(step));
+    if (preview?.fullResult) {
+      setResultDetail({ title: `${preview.name} 的完整试运行结果`, content: preview.fullResult });
+    } else {
+      setResultDetail({ title: `${step.name} 的完整结果`, content: getStepFullResult(step) });
+    }
   };
 
-  const openSuggestion = (suggestion: TreeSuggestion) => {
+  const openSuggestion = (suggestion: TreeSuggestion, preview?: TreePreviewResult) => {
     onSelectStep(suggestion.stepId);
     setEditingTarget({ type: 'suggestion', stepId: suggestion.stepId, suggestionId: suggestion.id });
+    setDetailTarget({ type: 'suggestion', stepId: suggestion.stepId, suggestionId: suggestion.id });
     setDraftPrompt(suggestion.prompt);
+    if (preview?.fullResult) {
+      setResultDetail({ title: `${suggestion.title} 的试运行结果`, content: preview.fullResult });
+    } else {
+      setResultDetail({ title: `${suggestion.title} 的预期结果`, content: suggestion.summary });
+    }
   };
 
   const closeEditor = () => {
     setEditingTarget(null);
+    setResultDetail(null);
+    setDetailTarget(null);
+    setIsDetailExpanded(false);
     setDraftPrompt('');
+  };
+
+  const openFinalResult = () => {
+    setEditingTarget(null);
+    setDraftPrompt('');
+    setDetailTarget({ type: 'final' });
+    setResultDetail({
+      title: '预测产生的完整结果',
+      content: previewFinalOutput,
+    });
   };
 
   const applyPrompt = () => {
@@ -175,22 +232,67 @@ export function PromptTreePanel({
     closeEditor();
   }, [resetSignal]);
 
+  useEffect(() => {
+    if (!detailTarget) return;
+
+    if (detailTarget.type === 'final') {
+      setResultDetail({
+        title: '预测产生的完整结果',
+        content: previewFinalOutput || '等待试运行生成最终结果',
+      });
+      return;
+    }
+
+    const step = subprocesses.find(item => item.id === detailTarget.stepId);
+    if (!step) return;
+    const preview = previewResults.find(item => item.stepId === detailTarget.stepId && item.status !== 'unchanged');
+
+    if (detailTarget.type === 'current') {
+      if (preview?.fullResult) {
+        setResultDetail({ title: `${preview.name} 的完整试运行结果`, content: preview.fullResult });
+      } else {
+        setResultDetail({ title: `${step.name} 的完整结果`, content: getStepFullResult(step) });
+      }
+      return;
+    }
+
+    const suggestion = [...(suggestionsByStep[detailTarget.stepId] || []), ...goalSuggestions]
+      .find(item => item.id === detailTarget.suggestionId);
+    if (preview?.fullResult) {
+      setResultDetail({ title: `${suggestion?.title || step.name} 的试运行结果`, content: preview.fullResult });
+    } else if (suggestion) {
+      setResultDetail({ title: `${suggestion.title} 的预期结果`, content: suggestion.summary });
+    }
+  }, [detailTarget, previewResults, previewFinalOutput, subprocesses, suggestionsByStep, goalSuggestions]);
+
   const editorTitle = (() => {
     if (!editingTarget) return '';
     const step = subprocesses.find(item => item.id === editingTarget.stepId);
     if (!step) return '';
     return editingTarget.type === 'current' ? `${step.name} 的摘要 Prompt` : `${step.name} 的建议方向`;
   })();
+  const hasActivePreview = previewResults.some(item => item.status !== 'unchanged') || Boolean(previewFinalOutput);
+  const canApplyCurrentPreview = Boolean(
+    editingTarget &&
+    previewResults.some(item => item.stepId === editingTarget.stepId && item.status === 'changed')
+  );
 
   const BranchButton = ({ suggestion }: { suggestion?: TreeSuggestion }) => {
     const isActiveSuggestion =
       editingTarget?.type === 'suggestion' &&
       suggestion &&
       editingTarget.suggestionId === suggestion.id;
+    const branchPreview = isActiveSuggestion
+      ? previewResults.find(item => item.stepId === suggestion?.stepId && item.status !== 'unchanged')
+      : undefined;
+    const branchSummary = compactResult(
+      branchPreview?.summary || suggestion?.summary || '等待子过程生成后提供建议结果方向',
+      34
+    );
 
     return (
     <button
-      onClick={() => suggestion && openSuggestion(suggestion)}
+      onClick={() => suggestion && openSuggestion(suggestion, branchPreview)}
       disabled={!suggestion}
       className={clsx(
         'min-h-[74px] rounded-lg border bg-white/95 px-3 py-2 text-left shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md disabled:opacity-40',
@@ -201,7 +303,13 @@ export function PromptTreePanel({
         <span className="text-xs font-semibold text-slate-600">{suggestion?.title || '其他方向'}</span>
         <span className={clsx('w-2 h-2 rounded-full', isActiveSuggestion ? 'bg-red-400' : 'bg-slate-300')} />
       </div>
-      <p className="mt-2 text-[11px] text-slate-500 leading-relaxed">{suggestion?.summary || '等待子过程生成后提供建议分支'}</p>
+      <p
+        className="mt-2 overflow-hidden text-[11px] text-slate-500 leading-relaxed"
+        style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}
+        title={branchPreview?.fullResult || branchSummary}
+      >
+        {branchSummary}
+      </p>
     </button>
     );
   };
@@ -211,7 +319,7 @@ export function PromptTreePanel({
       <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between">
         <div>
           <h3 className="text-xs font-semibold text-slate-700">目标-子过程树</h3>
-          <p className="text-[11px] text-slate-400 mt-0.5">红色为当前流程，灰色为AI建议方向</p>
+          <p className="text-[11px] text-slate-400 mt-0.5">红色为当前结果，灰色为AI建议结果方向</p>
         </div>
         <div className="flex items-center gap-1.5">
           <div className="flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5">
@@ -237,12 +345,12 @@ export function PromptTreePanel({
               +
             </button>
           </div>
-          {previewResults.length > 0 && (
+          {(hasActivePreview || canUndoTreeChange) && (
             <button
               onClick={onUndoPreview}
               className="px-2 py-1 rounded border border-slate-200 bg-white text-[11px] text-slate-500 hover:bg-slate-50"
             >
-              撤销预览
+              撤销更改
             </button>
           )}
         </div>
@@ -287,12 +395,15 @@ export function PromptTreePanel({
               {subprocesses.map((step, index) => {
                 const suggestions = suggestionsByStep[step.id] || [];
                 const isSelected = selectedStepId === step.id;
-                const currentPrompt = getCurrentPrompt(step);
                 const preview = previewResults.find(item => item.stepId === step.id);
                 const isPreviewChanged = preview?.status === 'changed';
                 const isPreviewAffected = preview?.status === 'affected';
-                const displayName = preview && preview.status !== 'unchanged' ? preview.name : step.name;
-                const displayText = preview && preview.status !== 'unchanged' ? preview.summary : currentPrompt;
+                const fullNodeTitle = preview && preview.status !== 'unchanged' ? preview.name : step.name;
+                const displayName = compactText(fullNodeTitle, 16);
+                const displayText = compactText(
+                  preview && preview.status !== 'unchanged' ? preview.summary : getStepResultSummary(step),
+                  22
+                );
                 const alteredPath = isPreviewChanged || isPreviewAffected;
 
                 return (
@@ -307,18 +418,20 @@ export function PromptTreePanel({
 
                       <div>
                         <button
-                          onClick={() => openCurrentStep(step)}
+                          onClick={() => openCurrentStep(step, preview)}
                           className={clsx(
-                            'w-full min-h-[106px] rounded-xl border-2 bg-white px-3 py-2 text-left transition-all hover:-translate-y-0.5',
+                            'w-full min-h-[88px] rounded-xl border-2 bg-white px-3 py-2 text-left transition-all hover:-translate-y-0.5',
                             isPreviewChanged ? 'border-red-500 bg-red-50 shadow-lg shadow-red-100' :
                               isPreviewAffected ? 'border-amber-400 bg-amber-50 shadow-md shadow-amber-100' :
                                 isSelected ? 'border-red-500 shadow-lg shadow-red-100' :
                                   'border-red-300 shadow-sm hover:border-red-400 hover:shadow-md'
                           )}
                         >
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm font-semibold text-slate-800">STEP {index + 1}: {displayName}</span>
-                            <div className="flex items-center gap-1.5">
+                          <div className="flex min-w-0 items-center justify-between gap-2">
+                            <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-800" title={fullNodeTitle}>
+                              STEP {index + 1}: {displayName}
+                            </span>
+                            <div className="flex shrink-0 items-center gap-1.5">
                               {preview && preview.status !== 'unchanged' && (
                                 <span className={clsx(
                                   'rounded-full px-1.5 py-0.5 text-[10px] font-medium',
@@ -334,9 +447,12 @@ export function PromptTreePanel({
                             </div>
                           </div>
                           <p className={clsx(
-                            'mt-2 text-[11px] leading-relaxed',
+                            'mt-2 text-[11px] leading-relaxed overflow-hidden',
                             isPreviewAffected ? 'text-amber-800' : isPreviewChanged ? 'text-red-700' : 'text-slate-600'
-                          )}>
+                          )}
+                            style={{ display: '-webkit-box', WebkitLineClamp: 1, WebkitBoxOrient: 'vertical' }}
+                            title={preview?.fullResult || getStepFullResult(step)}
+                          >
                             {displayText}
                           </p>
                         </button>
@@ -351,57 +467,130 @@ export function PromptTreePanel({
                 );
               })}
             </div>
+
+            {previewFinalOutput && (
+              <div className="mx-auto w-[760px]">
+                <div className="mx-auto h-9 w-px bg-emerald-400" />
+                <button
+                  onClick={openFinalResult}
+                  title={previewFinalOutput}
+                  className="mx-auto block w-[300px] rounded-xl border-2 border-emerald-300 bg-emerald-50 px-4 py-3 text-left shadow-sm transition-all hover:-translate-y-0.5 hover:border-emerald-400 hover:shadow-md"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-semibold text-emerald-800">预测产生的结果</span>
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                  </div>
+                  <p className="mt-2 text-[11px] text-emerald-700 leading-relaxed">{compactResult(previewFinalOutput, 36)}</p>
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>
 
-      {editingTarget && (
+      {(editingTarget || resultDetail) && (
         <div className="border-t border-slate-200 bg-slate-50 p-3">
           <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
             <div className="flex items-center justify-between gap-2">
               <div>
-                <div className="text-xs font-semibold text-slate-700">{editorTitle}</div>
-                {selectedStep && (
+                <div className="text-xs font-semibold text-slate-700">{resultDetail?.title || editorTitle}</div>
+                {editingTarget && selectedStep && (
                   <div className="text-[11px] text-slate-400 mt-0.5">同步步骤：{selectedStep.name}</div>
                 )}
               </div>
-              <button
-                onClick={closeEditor}
-                className="px-2 py-1 rounded text-[11px] text-slate-400 hover:bg-slate-100 hover:text-slate-600"
-              >
-                关闭
-              </button>
+              <div className="flex items-center gap-1.5">
+                {resultDetail && (
+                  <button
+                    onClick={() => setIsDetailExpanded(true)}
+                    className="px-2 py-1 rounded border border-slate-200 bg-white text-[11px] text-slate-500 hover:bg-slate-50"
+                  >
+                    放大查看
+                  </button>
+                )}
+                <button
+                  onClick={closeEditor}
+                  className="px-2 py-1 rounded text-[11px] text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                >
+                  关闭
+                </button>
+              </div>
             </div>
-            <textarea
-              value={draftPrompt}
-              onChange={(event) => setDraftPrompt(event.target.value)}
-              rows={4}
-              className="mt-2 w-full rounded border border-slate-200 px-2 py-1.5 text-xs resize-none focus:outline-none focus:ring-2 focus:ring-red-300"
-            />
-            <div className="mt-2 flex items-center justify-between gap-2">
-              <button
-                onClick={previewPrompt}
-                disabled={!draftPrompt.trim() || isPreviewing}
-                className="px-3 py-1.5 rounded bg-slate-800 text-white text-xs hover:bg-slate-700 disabled:opacity-40"
-              >
-                {isPreviewing ? '试运行中...' : '试运行'}
-              </button>
-              <div className="flex items-center gap-2">
+
+            {resultDetail && (
+              <pre className="mt-2 max-h-48 overflow-y-auto rounded border border-slate-200 bg-slate-50 px-2 py-1.5 text-[11px] leading-relaxed text-slate-600 whitespace-pre-wrap font-sans">
+                {resultDetail.content}
+              </pre>
+            )}
+
+            {editingTarget && (
+              <>
+                <textarea
+                  value={draftPrompt}
+                  onChange={(event) => setDraftPrompt(event.target.value)}
+                  rows={4}
+                  className="mt-2 w-full rounded border border-slate-200 px-2 py-1.5 text-xs resize-none focus:outline-none focus:ring-2 focus:ring-red-300"
+                />
+                <div className="mt-2 flex items-center justify-between gap-2">
+                  <button
+                    onClick={previewPrompt}
+                    disabled={!draftPrompt.trim() || isPreviewing}
+                    className="px-3 py-1.5 rounded bg-slate-800 text-white text-xs hover:bg-slate-700 disabled:opacity-40"
+                  >
+                    {isPreviewing ? '试运行中...' : '试运行'}
+                  </button>
+                  {canApplyCurrentPreview && (
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={onUndoPreview}
+                        className="px-3 py-1.5 rounded border border-slate-200 bg-white text-xs text-slate-500 hover:bg-slate-50"
+                      >
+                        撤销
+                      </button>
+                      <button
+                        onClick={applyPrompt}
+                        disabled={!draftPrompt.trim()}
+                        className="px-3 py-1.5 rounded bg-red-500 text-white text-xs hover:bg-red-600 disabled:opacity-40"
+                      >
+                        采纳到右侧
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+
+            {!editingTarget && resultDetail && (
+              <div className="mt-2 flex justify-end">
                 <button
                   onClick={onUndoPreview}
                   className="px-3 py-1.5 rounded border border-slate-200 bg-white text-xs text-slate-500 hover:bg-slate-50"
                 >
-                  撤销
-                </button>
-                <button
-                  onClick={applyPrompt}
-                  disabled={!draftPrompt.trim()}
-                  className="px-3 py-1.5 rounded bg-red-500 text-white text-xs hover:bg-red-600 disabled:opacity-40"
-                >
-                  采纳到右侧
+                  撤销预览
                 </button>
               </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {isDetailExpanded && resultDetail && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 px-6 py-8">
+          <div className="flex max-h-full w-full max-w-5xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-800">{resultDetail.title}</div>
+                <div className="mt-0.5 text-[11px] text-slate-400">完整内容，可滚动查看</div>
+              </div>
+              <button
+                onClick={() => setIsDetailExpanded(false)}
+                className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+              >
+                关闭
+              </button>
             </div>
+            <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap px-5 py-4 text-sm leading-7 text-slate-700 font-sans">
+              {resultDetail.content}
+            </pre>
           </div>
         </div>
       )}

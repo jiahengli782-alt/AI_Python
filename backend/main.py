@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 import json
 import re
+import os
 
 app = FastAPI(title="Agent Visualizer API")
 
@@ -32,7 +33,7 @@ app.add_middleware(
 # 豆包API配置
 DOUBAO_API_KEY = "13d7a163-eaaf-4ebd-8cd1-0f444ccbfd24"
 DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-MODEL_NAME = "doubao-1-5-pro-32k-250115"
+MODEL_NAME = os.getenv("DOUBAO_MODEL_NAME", "doubao-seed-1-6-250615")
 
 # ==================== 问题分类系统 ====================
 
@@ -302,6 +303,7 @@ class StreamSolveRequest(BaseModel):
     modifiedOutputs: Optional[Dict[str, str]] = None
     modifiedSteps: Optional[Dict[str, Any]] = None
     baseStages: Optional[List[Dict[str, Any]]] = None
+    previewMode: bool = False
 
 class UpdateSkillRequest(BaseModel):
     name: Optional[str] = None
@@ -339,7 +341,32 @@ STATS: Dict[str, Dict[str, Any]] = {}
 
 # ==================== 豆包API调用 ====================
 
-async def call_doubao_api(messages: List[Dict]) -> Tuple[str, float]:
+def compact_for_model(text: str, max_chars: int = 1600) -> str:
+    """压缩试运行上下文，保留开头和结尾，减少预览时的模型输入token。"""
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if len(clean) <= max_chars:
+        return clean
+    head = int(max_chars * 0.62)
+    tail = int(max_chars * 0.28)
+    return f"{clean[:head]}\n...\n{clean[-tail:]}"
+
+
+def is_quota_error(error_text: str) -> bool:
+    """识别额度/限流错误，避免后续步骤继续无意义调用。"""
+    text = error_text or ""
+    return (
+        "429" in text
+        or "SetLimitExceeded" in text
+        or "quota" in text.lower()
+        or "limit" in text.lower()
+    )
+
+
+async def call_doubao_api(
+    messages: List[Dict],
+    temperature: float = 0.7,
+    max_tokens: Optional[int] = None
+) -> Tuple[str, float]:
     """调用豆包API"""
     headers = {
         "Authorization": f"Bearer {DOUBAO_API_KEY}",
@@ -349,8 +376,10 @@ async def call_doubao_api(messages: List[Dict]) -> Tuple[str, float]:
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
-        "temperature": 0.7
+        "temperature": temperature
     }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
     
     start_time = time.time()
     
@@ -769,7 +798,8 @@ async def generate_solve_events(
     start_step_index: int = 0,
     modified_outputs: dict = None,
     modified_steps: dict = None,
-    base_stages: Optional[List[Dict[str, Any]]] = None
+    base_stages: Optional[List[Dict[str, Any]]] = None,
+    preview_mode: bool = False
 ):
     """生成SSE事件流
 
@@ -779,6 +809,7 @@ async def generate_solve_events(
         modified_outputs: 修改后的输出，格式为 {step_id: output_content}
         modified_steps: 修改后的步骤配置，格式为 {step_id: {"systemPrompt": ..., "userPromptTemplate": ..., "input": ...}}
         base_stages: 上一版完整步骤，用于固定规划并做版本差异测量
+        preview_mode: 树状图试运行模式，使用较短上下文和输出，且不写入正式会话/历史
     """
     execution_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now().isoformat()
@@ -846,9 +877,10 @@ async def generate_solve_events(
             'reasoning': subprocess.get("reasoning", "")
         })}\n\n"
 
-        # 更新当前会话状态
-        CURRENT_SESSION["currentSubprocess"] = subprocess_id
-        CURRENT_SESSION["isRunning"] = True
+        # 更新当前会话状态。试运行只返回临时预览，不污染正式会话。
+        if not preview_mode:
+            CURRENT_SESSION["currentSubprocess"] = subprocess_id
+            CURRENT_SESSION["isRunning"] = True
 
         # 获取该步骤的修改配置
         step_mod = (modified_steps or {}).get(subprocess_id, {})
@@ -859,15 +891,28 @@ async def generate_solve_events(
 
         # 如果有修改后的输入，优先使用
         step_input = step_mod.get("input") if step_mod.get("input") is not None else current_output
+        model_system_prompt = system_prompt
+        model_step_input = step_input
+        model_user_template = user_template
+
+        if preview_mode:
+            model_system_prompt = (
+                compact_for_model(system_prompt, 900)
+                + "\n\n这是树状图试运行预览：只输出会影响后续步骤的关键结论，控制在350字以内，不要展开冗长解释。"
+            )
+            model_step_input = compact_for_model(step_input, 900)
+            model_user_template = compact_for_model(user_template, 700)
 
         try:
-            user_content = user_template.format(
+            user_content = model_user_template.format(
                 question=question,
-                previous_output=step_input
+                previous_output=model_step_input
             )
         except (KeyError, ValueError):
-            user_content = f"{user_template}\n\n问题：{question}\n\n已知：\n{step_input}"
-        messages = [{"role": "system", "content": system_prompt}]
+            user_content = f"{model_user_template}\n\n问题：{question}\n\n已知：\n{model_step_input}"
+        if preview_mode:
+            user_content = compact_for_model(user_content, 1600)
+        messages = [{"role": "system", "content": model_system_prompt}]
         messages.append({"role": "user", "content": user_content})
 
         # 调用API
@@ -893,17 +938,27 @@ async def generate_solve_events(
                 # 发送API调用开始
                 yield f"event: api_call_start\ndata: {json.dumps({'stageId': subprocess_id, 'stageName': subprocess_name})}\n\n"
 
-                output, time_ms = await call_doubao_api(messages)
+                output, time_ms = await call_doubao_api(
+                    messages,
+                    temperature=0.25 if preview_mode else 0.7,
+                    max_tokens=520 if preview_mode else None
+                )
 
                 # 发送API调用完成
                 yield f"event: api_call_end\ndata: {json.dumps({'stageId': subprocess_id, 'timeMs': round(time_ms, 2)})}\n\n"
 
             except Exception as e:
-                output = f"API调用失败: {str(e)}"
+                error_text = str(e)
+                output = f"API调用失败: {error_text}"
                 time_ms = 0
 
                 # 发送API错误
-                yield f"event: api_error\ndata: {json.dumps({'stageId': subprocess_id, 'error': str(e)})}\n\n"
+                yield f"event: api_error\ndata: {json.dumps({'stageId': subprocess_id, 'error': error_text})}\n\n"
+                if is_quota_error(error_text):
+                    if not preview_mode:
+                        CURRENT_SESSION["currentSubprocess"] = None
+                        CURRENT_SESSION["isRunning"] = False
+                    return
         
         # ========== 健康度评估 ==========
         health_evaluation = await evaluate_step_health(
@@ -964,33 +1019,36 @@ async def generate_solve_events(
         stages.append(stage_data)
         
         # 更新统计
-        update_stats(subprocess_id, time_ms, accuracy)
+        if not preview_mode:
+            update_stats(subprocess_id, time_ms, accuracy)
         current_output = output
         
         # 发送阶段完成事件
         yield f"event: stage_complete\ndata: {json.dumps({'stage': stage_data, 'progress': ((idx + 1) / total_run_stages) * 100})}\n\n"
         
-        await asyncio.sleep(0.3)
+        if not preview_mode:
+            await asyncio.sleep(0.3)
     stages = apply_measured_impacts(stages, base_stages, start_step_index)
 
     # 更新当前会话
-    CURRENT_SESSION.update({
-        "question": question,
-        "subprocesses": stages,
-        "executionId": execution_id,
-        "timestamp": timestamp,
-        "currentSubprocess": None,
-        "isRunning": False
-    })
-    
-    # 记录历史
-    EXECUTION_HISTORY.append({
-        "id": execution_id,
-        "timestamp": timestamp,
-        "question": question,
-        "stages": stages,
-        "finalOutput": stages[-1]["output"] if stages else ""
-    })
+    if not preview_mode:
+        CURRENT_SESSION.update({
+            "question": question,
+            "subprocesses": stages,
+            "executionId": execution_id,
+            "timestamp": timestamp,
+            "currentSubprocess": None,
+            "isRunning": False
+        })
+
+        # 记录历史
+        EXECUTION_HISTORY.append({
+            "id": execution_id,
+            "timestamp": timestamp,
+            "question": question,
+            "stages": stages,
+            "finalOutput": stages[-1]["output"] if stages else ""
+        })
     
     # 提取最终答案（从最终步骤的输出中提取有意义的内容）
     final_answer = extract_final_answer(stages[-1]["output"] if stages else "")
@@ -1000,7 +1058,8 @@ async def generate_solve_events(
         'executionId': execution_id,
         'timestamp': timestamp,
         'stages': stages,
-        'finalOutput': final_answer
+        'finalOutput': final_answer,
+        'finalOutputFull': stages[-1]['output'] if stages else ""
     })}\n\n"
 
 
@@ -1121,7 +1180,8 @@ async def solve_stream(
     modifiedOutputs: str = None,
     modifiedSteps: str = None,
     baseStages: str = None,
-    useSessionBase: bool = False
+    useSessionBase: bool = False,
+    previewMode: bool = False
 ):
     """流式执行推理
 
@@ -1132,6 +1192,7 @@ async def solve_stream(
         modifiedSteps: JSON格式的修改后步骤配置，格式为 {step_id: {"systemPrompt": ..., "userPromptTemplate": ..., "input": ...}}
         baseStages: JSON格式的上一版完整步骤，用于固定规划
         useSessionBase: 为1时从当前会话读取上一版步骤，避免GET URL过长
+        previewMode: 为1时执行轻量试运行，不写入正式会话/历史
     """
     if not question or not question.strip():
         raise HTTPException(status_code=400, detail="Question is required")
@@ -1162,7 +1223,14 @@ async def solve_stream(
         parsed_base_stages = CURRENT_SESSION.get("subprocesses") or None
 
     return StreamingResponse(
-        generate_solve_events(question.strip(), startStepIndex, parsed_modifications, parsed_step_mods, parsed_base_stages),
+        generate_solve_events(
+            question.strip(),
+            startStepIndex,
+            parsed_modifications,
+            parsed_step_mods,
+            parsed_base_stages,
+            previewMode
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1183,7 +1251,8 @@ async def solve_stream_post(request: StreamSolveRequest):
             request.startStepIndex,
             request.modifiedOutputs,
             request.modifiedSteps,
-            request.baseStages
+            request.baseStages,
+            request.previewMode
         ),
         media_type="text/event-stream",
         headers={

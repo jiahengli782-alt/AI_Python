@@ -31,9 +31,9 @@ app.add_middleware(
 )
 
 # 豆包API配置
-DOUBAO_API_KEY = "13d7a163-eaaf-4ebd-8cd1-0f444ccbfd24"
+DOUBAO_API_KEY = os.getenv("ARK_API_KEY", "ark-a5594092-1603-42bb-9712-36a670b45718-36ecd")
 DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-MODEL_NAME = os.getenv("DOUBAO_MODEL_NAME", "doubao-seed-1-6-250615")
+MODEL_NAME = os.getenv("DOUBAO_MODEL_NAME", "ep-m-20260414114056-685z2")
 
 # ==================== 问题分类系统 ====================
 
@@ -304,6 +304,7 @@ class StreamSolveRequest(BaseModel):
     modifiedSteps: Optional[Dict[str, Any]] = None
     baseStages: Optional[List[Dict[str, Any]]] = None
     previewMode: bool = False
+    reasoningEffort: str = "medium"
 
 class UpdateSkillRequest(BaseModel):
     name: Optional[str] = None
@@ -362,50 +363,71 @@ def is_quota_error(error_text: str) -> bool:
     )
 
 
+def _make_httpx_client(proxy: Optional[str] = None) -> httpx.AsyncClient:
+    """创建 httpx 客户端，兼容新旧版本的代理参数名
+
+    注意：trust_env=False 让 httpx 忽略系统的 HTTP_PROXY/HTTPS_PROXY 环境变量，
+    避免 Clash/V2Ray 等代理软件干扰 HTTPS 连接导致 SSL_EOF 错误。
+    如需主动走代理，请通过参数显式传 proxy。
+    """
+    if not proxy:
+        return httpx.AsyncClient(timeout=120.0, trust_env=False)
+    try:
+        return httpx.AsyncClient(timeout=120.0, proxy=proxy, trust_env=False)   # httpx >= 0.20
+    except TypeError:
+        return httpx.AsyncClient(timeout=120.0, proxies=proxy, trust_env=False) # httpx < 0.20
+
+
 async def call_doubao_api(
     messages: List[Dict],
     temperature: float = 0.7,
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None,
+    reasoning_effort: str = "medium"
 ) -> Tuple[str, float]:
-    """调用豆包API"""
+    """调用豆包API (doubao-seed-1-6-251015)"""
     headers = {
         "Authorization": f"Bearer {DOUBAO_API_KEY}",
         "Content-Type": "application/json"
     }
-    
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
-        "temperature": temperature
+        "reasoning_effort": reasoning_effort,
+        "max_completion_tokens": max_tokens if max_tokens else 65535,
     }
-    if max_tokens:
-        payload["max_tokens"] = max_tokens
-    
+
+    env_proxy = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+        or os.environ.get("ALL_PROXY")
+    )
+
     start_time = time.time()
-    
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with _make_httpx_client(env_proxy) as client:
             response = await client.post(
                 f"{DOUBAO_BASE_URL}/chat/completions",
                 headers=headers,
                 json=payload
             )
-            
+
             elapsed_time = (time.time() - start_time) * 1000
-            
+
             if response.status_code != 200:
                 error_detail = response.text
                 raise Exception(f"API调用失败: {response.status_code} - {error_detail}")
-            
+
             result = response.json()
             content = result["choices"][0]["message"]["content"]
-            
+
             if "<|FunctionExecuteResult|>" in content:
                 content = content.split("<|FunctionExecuteResult|>")[-1]
                 content = content.split("<|FunctionExecuteResultEnd|>")[0] if "<|FunctionExecuteResultEnd|>" in content else content
-            
+
             return content.strip(), elapsed_time
-            
+
     except httpx.HTTPStatusError as e:
         raise Exception(f"API调用失败: {e.response.status_code} - {e.response.text}")
     except Exception as e:
@@ -799,7 +821,8 @@ async def generate_solve_events(
     modified_outputs: dict = None,
     modified_steps: dict = None,
     base_stages: Optional[List[Dict[str, Any]]] = None,
-    preview_mode: bool = False
+    preview_mode: bool = False,
+    reasoning_effort: str = "medium"
 ):
     """生成SSE事件流
 
@@ -941,7 +964,8 @@ async def generate_solve_events(
                 output, time_ms = await call_doubao_api(
                     messages,
                     temperature=0.25 if preview_mode else 0.7,
-                    max_tokens=520 if preview_mode else None
+                    max_tokens=4096 if preview_mode else None,
+                    reasoning_effort="minimal" if preview_mode else reasoning_effort
                 )
 
                 # 发送API调用完成
@@ -1181,7 +1205,8 @@ async def solve_stream(
     modifiedSteps: str = None,
     baseStages: str = None,
     useSessionBase: bool = False,
-    previewMode: bool = False
+    previewMode: bool = False,
+    reasoningEffort: str = "medium"
 ):
     """流式执行推理
 
@@ -1193,6 +1218,7 @@ async def solve_stream(
         baseStages: JSON格式的上一版完整步骤，用于固定规划
         useSessionBase: 为1时从当前会话读取上一版步骤，避免GET URL过长
         previewMode: 为1时执行轻量试运行，不写入正式会话/历史
+        reasoningEffort: 思考程度 minimal/low/medium/high
     """
     if not question or not question.strip():
         raise HTTPException(status_code=400, detail="Question is required")
@@ -1229,7 +1255,8 @@ async def solve_stream(
             parsed_modifications,
             parsed_step_mods,
             parsed_base_stages,
-            previewMode
+            previewMode,
+            reasoningEffort
         ),
         media_type="text/event-stream",
         headers={
@@ -1252,7 +1279,8 @@ async def solve_stream_post(request: StreamSolveRequest):
             request.modifiedOutputs,
             request.modifiedSteps,
             request.baseStages,
-            request.previewMode
+            request.previewMode,
+            request.reasoningEffort
         ),
         media_type="text/event-stream",
         headers={

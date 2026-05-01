@@ -155,6 +155,7 @@ export default function App() {
     stages: Subprocess[];
     timestamp: number;
   }[]>([]);
+  const [reasoningEffort, setReasoningEffort] = useState<'minimal' | 'low' | 'medium' | 'high'>('medium');
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const stepCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
@@ -167,6 +168,7 @@ export default function App() {
     modifiedSteps?: Record<string, any>;
     baseStages?: Subprocess[];
     previewMode?: boolean;
+    reasoningEffort?: string;
   }) => {
     const params = new URLSearchParams({ question: payload.question });
 
@@ -188,6 +190,10 @@ export default function App() {
 
     if (payload.previewMode) {
       params.set('previewMode', '1');
+    }
+
+    if (payload.reasoningEffort) {
+      params.set('reasoningEffort', payload.reasoningEffort);
     }
 
     const postStream = () => fetch('http://localhost:8000/api/solve/stream', {
@@ -733,7 +739,7 @@ export default function App() {
     setTreeResetSignal(prev => prev + 1);
 
     try {
-      const response = await streamSolve({ question: userQuestion });
+      const response = await streamSolve({ question: userQuestion, reasoningEffort });
       if (!response.ok) throw new Error(`请求失败: ${response.status}`);
 
       const reader = response.body?.getReader();
@@ -1238,8 +1244,42 @@ export default function App() {
             <div ref={chatEndRef} />
           </div>
 
+          {/* 思考程度选择器 */}
+          <div className="px-4 pt-3 pb-1 border-t border-slate-100 bg-slate-50">
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-500 flex-shrink-0">思考程度</span>
+              <div className="flex gap-1 flex-1">
+                {(['minimal', 'low', 'medium', 'high'] as const).map((level) => {
+                  const labels = { minimal: '关闭', low: '低', medium: '中', high: '高' };
+                  const colors = {
+                    minimal: reasoningEffort === level ? 'bg-slate-500 text-white' : 'bg-white text-slate-500 border border-slate-300',
+                    low: reasoningEffort === level ? 'bg-blue-400 text-white' : 'bg-white text-slate-500 border border-slate-300',
+                    medium: reasoningEffort === level ? 'bg-purple-500 text-white' : 'bg-white text-slate-500 border border-slate-300',
+                    high: reasoningEffort === level ? 'bg-orange-500 text-white' : 'bg-white text-slate-500 border border-slate-300',
+                  };
+                  return (
+                    <button
+                      key={level}
+                      type="button"
+                      onClick={() => setReasoningEffort(level)}
+                      className={`flex-1 py-1 rounded-lg text-xs font-medium transition-colors ${colors[level]}`}
+                    >
+                      {labels[level]}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <p className="text-[10px] text-slate-400 mt-1">
+              {reasoningEffort === 'minimal' && '不启用思考，最快响应'}
+              {reasoningEffort === 'low' && '轻度思考，速度与质量平衡'}
+              {reasoningEffort === 'medium' && '中等思考，适合大多数问题'}
+              {reasoningEffort === 'high' && '深度思考，复杂问题推荐，耗时较长'}
+            </p>
+          </div>
+
           {/* 输入框 */}
-          <div className="p-4 border-t border-slate-100 bg-slate-50">
+          <div className="px-4 pb-4 bg-slate-50">
             <form onSubmit={(e) => { e.preventDefault(); executeSolve(); }} className="flex gap-2">
               <textarea
                 value={question}

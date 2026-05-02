@@ -76,7 +76,8 @@ function compactResult(text: string, maxLength = 24) {
   return meaningful.length > maxLength ? meaningful.slice(0, maxLength) : meaningful;
 }
 
-function extractTreePrompt(text: string) {
+// 仅用于树节点小卡片的"显示"：必须截断，否则 UI 撑爆
+function extractTreePromptForDisplay(text: string) {
   if (!text) return '';
   const markerIndex = text.indexOf(marker);
   if (markerIndex >= 0) {
@@ -85,6 +86,21 @@ function extractTreePrompt(text: string) {
   }
   return compactText(text, 92);
 }
+
+// 用于编辑框的"取值"：返回完整内容，不截断（编辑时用户需要看到完整 prompt）
+function extractTreePromptForEdit(text: string) {
+  if (!text) return '';
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex >= 0) {
+    const afterMarker = text.slice(markerIndex + marker.length).trim();
+    // 只取摘要 marker 后第一段，但不再做长度截断
+    return afterMarker.split(/\n\s*\n/)[0].trim();
+  }
+  return text.trim();
+}
+
+// 兼容旧调用名称
+const extractTreePrompt = extractTreePromptForDisplay;
 
 function buildStepSuggestions(step: Subprocess, index: number): TreeSuggestion[] {
   const base = step.name || `步骤${index + 1}`;
@@ -164,10 +180,11 @@ export function PromptTreePanel({
     setZoom(prev => Math.max(0.68, Math.min(1.35, Number((prev + delta).toFixed(2)))));
   };
 
+  // 编辑用：返回完整 prompt，不截断
   const getCurrentPrompt = (step: Subprocess) => {
-    if (editingStepId === step.id && editedSystemPrompt) return extractTreePrompt(editedSystemPrompt);
+    if (editingStepId === step.id && editedSystemPrompt) return extractTreePromptForEdit(editedSystemPrompt);
     if (promptDrafts[step.id]) return promptDrafts[step.id];
-    return extractTreePrompt(step.systemPrompt || step.description || step.input);
+    return extractTreePromptForEdit(step.systemPrompt || step.description || step.input);
   };
 
   const getStepResultSummary = (step: Subprocess) =>
@@ -316,10 +333,20 @@ export function PromptTreePanel({
 
   return (
     <div className="h-full bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
-      <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between">
+      <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
         <div>
-          <h3 className="text-xs font-semibold text-slate-700">目标-子过程树</h3>
-          <p className="text-[11px] text-slate-400 mt-0.5">红色为当前结果，灰色为AI建议结果方向</p>
+          <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7h18M3 12h18M3 17h18" />
+            </svg>
+            目标-子过程树
+            {subprocesses.length > 0 && (
+              <span className="ml-1 text-xs bg-purple-100 text-purple-600 px-2 py-0.5 rounded-full">
+                {subprocesses.length}
+              </span>
+            )}
+          </h3>
+          <p className="text-[11px] text-slate-400 mt-0.5">红色为当前结果，灰色为AI建议方向</p>
         </div>
         <div className="flex items-center gap-1.5">
           <div className="flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5">
@@ -524,11 +551,23 @@ export function PromptTreePanel({
 
             {editingTarget && (
               <>
+                <div className="mt-2 flex items-center justify-between">
+                  <span className="text-[11px] text-slate-400">
+                    完整 System Prompt（可滚动 / 放大编辑），共 {draftPrompt.length} 字
+                  </span>
+                  <button
+                    onClick={() => setIsDetailExpanded(true)}
+                    className="px-2 py-0.5 rounded border border-slate-200 bg-white text-[11px] text-slate-500 hover:bg-slate-50"
+                  >
+                    放大编辑
+                  </button>
+                </div>
                 <textarea
                   value={draftPrompt}
                   onChange={(event) => setDraftPrompt(event.target.value)}
-                  rows={4}
-                  className="mt-2 w-full rounded border border-slate-200 px-2 py-1.5 text-xs resize-none focus:outline-none focus:ring-2 focus:ring-red-300"
+                  rows={8}
+                  className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs leading-relaxed resize-y focus:outline-none focus:ring-2 focus:ring-red-300 font-mono"
+                  style={{ minHeight: 140, maxHeight: 360 }}
                 />
                 <div className="mt-2 flex items-center justify-between gap-2">
                   <button
@@ -573,13 +612,17 @@ export function PromptTreePanel({
         </div>
       )}
 
-      {isDetailExpanded && resultDetail && (
+      {isDetailExpanded && (resultDetail || editingTarget) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 px-6 py-8">
           <div className="flex max-h-full w-full max-w-5xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div>
-                <div className="text-sm font-semibold text-slate-800">{resultDetail.title}</div>
-                <div className="mt-0.5 text-[11px] text-slate-400">完整内容，可滚动查看</div>
+                <div className="text-sm font-semibold text-slate-800">
+                  {editingTarget ? `${editorTitle}（放大编辑）` : resultDetail?.title}
+                </div>
+                <div className="mt-0.5 text-[11px] text-slate-400">
+                  {editingTarget ? '可直接修改 Prompt 后点试运行 / 采纳' : '完整内容，可滚动查看'}
+                </div>
               </div>
               <button
                 onClick={() => setIsDetailExpanded(false)}
@@ -588,9 +631,54 @@ export function PromptTreePanel({
                 关闭
               </button>
             </div>
-            <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap px-5 py-4 text-sm leading-7 text-slate-700 font-sans">
-              {resultDetail.content}
-            </pre>
+            {editingTarget ? (
+              <div className="flex flex-col gap-3 px-5 py-4">
+                {resultDetail && (
+                  <details className="rounded border border-slate-200 bg-slate-50">
+                    <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-slate-600">
+                      查看当前结果（{resultDetail.title}）
+                    </summary>
+                    <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap px-3 py-2 text-xs leading-6 text-slate-600 font-sans">
+                      {resultDetail.content}
+                    </pre>
+                  </details>
+                )}
+                <textarea
+                  value={draftPrompt}
+                  onChange={(event) => setDraftPrompt(event.target.value)}
+                  className="w-full rounded border border-slate-200 px-3 py-2 text-sm leading-7 font-mono resize-y focus:outline-none focus:ring-2 focus:ring-red-300"
+                  style={{ minHeight: '50vh', maxHeight: '65vh' }}
+                  placeholder="编辑 System Prompt..."
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-slate-400">共 {draftPrompt.length} 字符</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={previewPrompt}
+                      disabled={!draftPrompt.trim() || isPreviewing}
+                      className="px-4 py-1.5 rounded bg-slate-800 text-white text-sm hover:bg-slate-700 disabled:opacity-40"
+                    >
+                      {isPreviewing ? '试运行中...' : '试运行'}
+                    </button>
+                    {canApplyCurrentPreview && (
+                      <button
+                        onClick={() => { applyPrompt(); setIsDetailExpanded(false); }}
+                        disabled={!draftPrompt.trim()}
+                        className="px-4 py-1.5 rounded bg-red-500 text-white text-sm hover:bg-red-600 disabled:opacity-40"
+                      >
+                        采纳到右侧
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              resultDetail && (
+                <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap px-5 py-4 text-sm leading-7 text-slate-700 font-sans">
+                  {resultDetail.content}
+                </pre>
+              )
+            )}
           </div>
         </div>
       )}

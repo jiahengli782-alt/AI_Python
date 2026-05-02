@@ -370,12 +370,41 @@ def _make_httpx_client(proxy: Optional[str] = None) -> httpx.AsyncClient:
     避免 Clash/V2Ray 等代理软件干扰 HTTPS 连接导致 SSL_EOF 错误。
     如需主动走代理，请通过参数显式传 proxy。
     """
+    # 提高连接池上限，降低高并发时的握手开销
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=40, keepalive_expiry=60.0)
     if not proxy:
-        return httpx.AsyncClient(timeout=120.0, trust_env=False)
+        return httpx.AsyncClient(timeout=120.0, trust_env=False, limits=limits)
     try:
-        return httpx.AsyncClient(timeout=120.0, proxy=proxy, trust_env=False)   # httpx >= 0.20
+        return httpx.AsyncClient(timeout=120.0, proxy=proxy, trust_env=False, limits=limits)   # httpx >= 0.20
     except TypeError:
-        return httpx.AsyncClient(timeout=120.0, proxies=proxy, trust_env=False) # httpx < 0.20
+        return httpx.AsyncClient(timeout=120.0, proxies=proxy, trust_env=False, limits=limits) # httpx < 0.20
+
+
+# 全局复用的 httpx 客户端，避免每次调用都重建 TCP+SSL 连接（每次握手~200-500ms）
+_GLOBAL_HTTPX_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def get_global_client() -> httpx.AsyncClient:
+    """获取全局复用的 httpx 客户端，懒初始化"""
+    global _GLOBAL_HTTPX_CLIENT
+    if _GLOBAL_HTTPX_CLIENT is None or _GLOBAL_HTTPX_CLIENT.is_closed:
+        env_proxy = (
+            os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+            or os.environ.get("ALL_PROXY")
+        )
+        _GLOBAL_HTTPX_CLIENT = _make_httpx_client(env_proxy)
+    return _GLOBAL_HTTPX_CLIENT
+
+
+@app.on_event("shutdown")
+async def shutdown_httpx_client():
+    """服务关闭时优雅关闭 httpx 客户端"""
+    global _GLOBAL_HTTPX_CLIENT
+    if _GLOBAL_HTTPX_CLIENT and not _GLOBAL_HTTPX_CLIENT.is_closed:
+        await _GLOBAL_HTTPX_CLIENT.aclose()
 
 
 async def call_doubao_api(
@@ -389,44 +418,40 @@ async def call_doubao_api(
         "Authorization": f"Bearer {DOUBAO_API_KEY}",
         "Content-Type": "application/json"
     }
+    # 默认上限收紧到 8192：足够覆盖单个推理步骤的 JSON 输出，
+    # 同时减少模型"放飞自我"导致的长尾输出耗时。
+    # 65535 是模型理论上限，但实际单步推理用不到那么多，反而拖慢响应。
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
         "reasoning_effort": reasoning_effort,
-        "max_completion_tokens": max_tokens if max_tokens else 65535,
+        "max_completion_tokens": max_tokens if max_tokens else 8192,
     }
-
-    env_proxy = (
-        os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("http_proxy")
-        or os.environ.get("ALL_PROXY")
-    )
 
     start_time = time.time()
     try:
-        async with _make_httpx_client(env_proxy) as client:
-            response = await client.post(
-                f"{DOUBAO_BASE_URL}/chat/completions",
-                headers=headers,
-                json=payload
-            )
+        # 复用全局客户端，避免每次重建 TCP+SSL 连接
+        client = get_global_client()
+        response = await client.post(
+            f"{DOUBAO_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload
+        )
 
-            elapsed_time = (time.time() - start_time) * 1000
+        elapsed_time = (time.time() - start_time) * 1000
 
-            if response.status_code != 200:
-                error_detail = response.text
-                raise Exception(f"API调用失败: {response.status_code} - {error_detail}")
+        if response.status_code != 200:
+            error_detail = response.text
+            raise Exception(f"API调用失败: {response.status_code} - {error_detail}")
 
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
 
-            if "<|FunctionExecuteResult|>" in content:
-                content = content.split("<|FunctionExecuteResult|>")[-1]
-                content = content.split("<|FunctionExecuteResultEnd|>")[0] if "<|FunctionExecuteResultEnd|>" in content else content
+        if "<|FunctionExecuteResult|>" in content:
+            content = content.split("<|FunctionExecuteResult|>")[-1]
+            content = content.split("<|FunctionExecuteResultEnd|>")[0] if "<|FunctionExecuteResultEnd|>" in content else content
 
-            return content.strip(), elapsed_time
+        return content.strip(), elapsed_time
 
     except httpx.HTTPStatusError as e:
         raise Exception(f"API调用失败: {e.response.status_code} - {e.response.text}")
@@ -751,7 +776,9 @@ async def plan_subprocesses(question: str) -> List[Dict[str, Any]]:
             {"role": "user", "content": planning_prompt}
         ]
 
-        content, _ = await call_doubao_api(messages)
+        # 规划阶段用 minimal 推理强度 + 较小 max_tokens：
+        # 规划只是输出 JSON 结构，不需要深度思考，可以省 3-8 秒
+        content, _ = await call_doubao_api(messages, reasoning_effort="minimal", max_tokens=2048)
 
         # 解析JSON
         json_match = re.search(r'\{[\s\S]*\}', content)
@@ -873,8 +900,6 @@ async def generate_solve_events(
         } for s in subprocesses
     ]})}\n\n"
     
-    await asyncio.sleep(0.5)
-    
     preserved_stages = [dict(stage) for stage in (base_stages or [])[:start_step_index]]
     stages = preserved_stages.copy()
     current_output = stages[-1].get("output", question) if stages else question
@@ -961,10 +986,21 @@ async def generate_solve_events(
                 # 发送API调用开始
                 yield f"event: api_call_start\ndata: {json.dumps({'stageId': subprocess_id, 'stageName': subprocess_name})}\n\n"
 
+                # 速度优化：根据场景选择 max_tokens
+                # - 试运行：4096（最快）
+                # - 修改重算（base_stages 存在）：4096（重算只需看变化，不需要长输出）
+                # - 正常推理：默认 8192
+                if preview_mode:
+                    step_max_tokens = 4096
+                elif base_stages:
+                    step_max_tokens = 4096
+                else:
+                    step_max_tokens = None  # 用 call_doubao_api 内的默认值 8192
+
                 output, time_ms = await call_doubao_api(
                     messages,
                     temperature=0.25 if preview_mode else 0.7,
-                    max_tokens=4096 if preview_mode else None,
+                    max_tokens=step_max_tokens,
                     reasoning_effort="minimal" if preview_mode else reasoning_effort
                 )
 
@@ -1049,9 +1085,6 @@ async def generate_solve_events(
         
         # 发送阶段完成事件
         yield f"event: stage_complete\ndata: {json.dumps({'stage': stage_data, 'progress': ((idx + 1) / total_run_stages) * 100})}\n\n"
-        
-        if not preview_mode:
-            await asyncio.sleep(0.3)
     stages = apply_measured_impacts(stages, base_stages, start_step_index)
 
     # 更新当前会话
@@ -1076,14 +1109,22 @@ async def generate_solve_events(
     
     # 提取最终答案（从最终步骤的输出中提取有意义的内容）
     final_answer = extract_final_answer(stages[-1]["output"] if stages else "")
-    
+
+    # 把所有步骤的输出拼起来，作为"完整原文"提供给前端
+    # 这样用户看到的不是只有最后一步的精简答案，而是 AI 推理过程中产生的所有内容
+    all_stages_output = "\n\n".join([
+        f"━━━━━━ 步骤 {i+1}: {s.get('name', '')} ━━━━━━\n{s.get('output', '').strip()}"
+        for i, s in enumerate(stages) if (s.get('output') or '').strip()
+    ]) if stages else ""
+
     # 发送完成事件
     yield f"event: complete\ndata: {json.dumps({
         'executionId': execution_id,
         'timestamp': timestamp,
         'stages': stages,
         'finalOutput': final_answer,
-        'finalOutputFull': stages[-1]['output'] if stages else ""
+        'finalOutputFull': stages[-1]['output'] if stages else "",
+        'allStagesOutput': all_stages_output
     })}\n\n"
 
 
@@ -1123,9 +1164,10 @@ def extract_final_answer(output: str) -> str:
         pass
     
     # 如果不是JSON或解析失败，尝试清理并返回原始内容
+    # 不再做 500 字截断，前端聊天框需要完整答案；前端会用 max-h + scroll 显示
     cleaned = re.sub(r'```json\n?', '', output)
     cleaned = re.sub(r'```\n?', '', cleaned).strip()
-    return cleaned if len(cleaned) < 500 else cleaned[:500] + "..."
+    return cleaned
 
 def update_stats(stage_id: str, time_ms: float, accuracy: float):
     """更新统计信息（基于真实数据）"""
@@ -1422,6 +1464,61 @@ async def reset():
     global STATS
     STATS = {}
     return {"message": "统计已重置"}
+
+
+# ==================== 标题生成 ====================
+
+class TitleGenerateRequest(BaseModel):
+    text: str
+    max_length: int = 14
+
+
+@app.post("/api/title/generate")
+async def generate_title(request: TitleGenerateRequest):
+    """用 minimal 推理把用户问题压成精简标题（8-15 字）
+
+    前端在新建会话第一次保存时调用，让侧边栏的对话标题更短更精炼。
+    用 minimal 推理 + max_tokens=64，几乎瞬时返回。
+    """
+    raw_text = (request.text or "").strip()
+    if not raw_text:
+        return {"title": "新对话"}
+
+    # 长度太短直接返回原文，没必要调模型
+    if len(raw_text) <= request.max_length:
+        return {"title": raw_text}
+
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"你是标题生成助手。把用户输入压缩为不超过 {request.max_length} 个汉字的精炼标题，"
+                    "只输出标题本身、不带引号、不带标点、不带额外解释。"
+                    "标题需保留主题关键词，去除疑问词、客套词。"
+                ),
+            },
+            {"role": "user", "content": raw_text},
+        ]
+        title, _ = await call_doubao_api(
+            messages,
+            reasoning_effort="minimal",
+            max_tokens=64,
+        )
+        # 清洗：去引号、换行、首尾标点
+        cleaned = re.sub(r'^["\'《【\s]+|["\'》】\s。.！!？?]+$', '', title.strip())
+        cleaned = cleaned.split("\n")[0].strip()
+        if not cleaned:
+            cleaned = raw_text[: request.max_length]
+        # 兜底：超长再截
+        if len(cleaned) > request.max_length + 6:
+            cleaned = cleaned[: request.max_length] + "..."
+        return {"title": cleaned}
+    except Exception as e:
+        # AI 生成失败就用前 N 字兜底，不抛错
+        print(f"[标题生成失败] {e}")
+        return {"title": raw_text[: request.max_length] + ("..." if len(raw_text) > request.max_length else "")}
+
 
 if __name__ == "__main__":
     import uvicorn

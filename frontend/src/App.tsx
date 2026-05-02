@@ -2,6 +2,183 @@ import { useEffect, useState, useRef } from 'react';
 import clsx from 'clsx';
 import { ModificationFlow } from './components/ModificationFlow';
 import { PromptTreePanel, type TreePreviewResult } from './components/PromptTreePanel';
+import { ChatHistoryPanel, type ConversationSnapshot } from './components/ChatHistoryPanel';
+
+const CONVERSATIONS_STORAGE_KEY = 'agent_conversations_v1';
+const ACTIVE_CONVERSATION_STORAGE_KEY = 'agent_active_conversation_v1';
+
+function generateConversationId(): string {
+  return `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function loadConversationsFromStorage(): ConversationSnapshot[] {
+  try {
+    const raw = localStorage.getItem(CONVERSATIONS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // 反序列化时把 timestamp Date 还原回去
+    return parsed.map((c: any) => ({
+      ...c,
+      chatMessages: (c.chatMessages || []).map((m: any) => ({
+        ...m,
+        timestamp: new Date(m.timestamp),
+      })),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// 内嵌：消息全屏查看 modal，自带 3 个 tab 切换 + 复制
+function ViewingMessageModal({ msg, onClose }: {
+  msg: { id: string; role: 'user' | 'assistant'; content: string; fullContent?: string; allStagesContent?: string; timestamp: Date };
+  onClose: () => void;
+}) {
+  // 准备 3 种视图的内容
+  const summaryText = msg.content || '';
+  const fullText = msg.fullContent || '';
+  const allText = msg.allStagesContent || '';
+  // 哪些 tab 有内容（去重 + 比 summary 更长才有意义）
+  const hasFull = !!(fullText && fullText.length > summaryText.length && fullText !== summaryText);
+  const hasAll = !!(allText && allText.length > summaryText.length && allText !== summaryText && allText !== fullText);
+
+  // 默认显示哪个 tab：优先"全部步骤"，再是"完整原文"，再是"精简"
+  type TabKey = 'summary' | 'full' | 'all';
+  const defaultTab: TabKey =
+    msg.role === 'assistant' && hasAll ? 'all' :
+      msg.role === 'assistant' && hasFull ? 'full' :
+        'summary';
+  const [activeTab, setActiveTab] = useState<TabKey>(defaultTab);
+  const [copied, setCopied] = useState(false);
+
+  const currentText =
+    activeTab === 'all' ? allText :
+      activeTab === 'full' ? fullText :
+        summaryText;
+
+  const handleCopy = () => {
+    navigator.clipboard?.writeText(currentText).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
+  const showTabs = hasFull || hasAll; // 只要有任一额外视图就展示 tab 区
+
+  return (
+    <div
+      className="flex max-h-full w-full max-w-4xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-3">
+        <div>
+          <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+            <span
+              className={clsx(
+                'inline-block px-2 py-0.5 rounded text-xs',
+                msg.role === 'user' ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-700'
+              )}
+            >
+              {msg.role === 'user' ? '用户' : 'AI 回复'}
+            </span>
+            完整消息内容
+          </div>
+          <div className="mt-0.5 text-[11px] text-slate-400">
+            {msg.timestamp.toLocaleString('zh-CN')} · 当前显示 {currentText.length} 字
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleCopy}
+            className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-600 hover:bg-slate-50 flex items-center gap-1"
+            title="复制当前显示的内容"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+            {copied ? '已复制 ✓' : '复制'}
+          </button>
+          <button
+            onClick={onClose}
+            className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+      {showTabs && (
+        <div className="flex items-center gap-1.5 border-b border-slate-100 px-5 py-2 bg-slate-50 flex-wrap">
+          <button
+            onClick={() => setActiveTab('summary')}
+            className={clsx(
+              'px-3 py-1 rounded text-xs font-medium transition-colors',
+              activeTab === 'summary' ? 'bg-purple-100 text-purple-700' : 'text-slate-500 hover:bg-slate-100'
+            )}
+          >
+            精简答案 ({summaryText.length} 字)
+          </button>
+          {hasFull && (
+            <button
+              onClick={() => setActiveTab('full')}
+              className={clsx(
+                'px-3 py-1 rounded text-xs font-medium transition-colors',
+                activeTab === 'full' ? 'bg-purple-100 text-purple-700' : 'text-slate-500 hover:bg-slate-100'
+              )}
+            >
+              最后一步原文 ({fullText.length} 字)
+            </button>
+          )}
+          {hasAll && (
+            <button
+              onClick={() => setActiveTab('all')}
+              className={clsx(
+                'px-3 py-1 rounded text-xs font-medium transition-colors flex items-center gap-1',
+                activeTab === 'all' ? 'bg-emerald-100 text-emerald-700' : 'text-slate-500 hover:bg-slate-100'
+              )}
+              title="所有推理步骤的完整输出，包含 AI 全部产出"
+            >
+              <span>📚</span>
+              全部步骤输出 ({allText.length} 字)
+            </button>
+          )}
+          <span className="ml-auto text-[10px] text-slate-400">
+            {activeTab === 'all' ? '所有推理步骤的完整输出（推荐）' :
+              activeTab === 'full' ? '最后一步未提取的完整模型输出' :
+                '提取后的精简答案（与气泡显示一致）'}
+          </span>
+        </div>
+      )}
+      <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap break-words px-6 py-5 text-sm leading-7 text-slate-700 font-sans">
+        {currentText}
+      </pre>
+    </div>
+  );
+}
+
+function persistConversations(conversations: ConversationSnapshot[]) {
+  try {
+    localStorage.setItem(CONVERSATIONS_STORAGE_KEY, JSON.stringify(conversations));
+  } catch (err) {
+    console.warn('无法持久化对话历史:', err);
+  }
+}
+
+// 调用后端用 AI 生成精简标题，失败就返回 null
+async function generateAITitle(text: string, maxLength = 14): Promise<string | null> {
+  try {
+    const res = await fetch('http://localhost:8000/api/title/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, max_length: maxLength }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.title || null;
+  } catch {
+    return null;
+  }
+}
 
 interface Subprocess {
   id: string;
@@ -38,6 +215,10 @@ interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  /** 最后一步未提取的原始输出（一般是 JSON） */
+  fullContent?: string;
+  /** 全部推理步骤的输出拼接（最完整的内容，用于查看 AI 全部产出） */
+  allStagesContent?: string;
   timestamp: Date;
 }
 
@@ -156,10 +337,35 @@ export default function App() {
     timestamp: number;
   }[]>([]);
   const [reasoningEffort, setReasoningEffort] = useState<'minimal' | 'low' | 'medium' | 'high'>('medium');
+  // 对话历史：所有过去的会话
+  const [conversations, setConversations] = useState<ConversationSnapshot[]>(() => loadConversationsFromStorage());
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  });
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const stepCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const treeEditSnapshotRef = useRef<TreeEditSnapshot | null>(null);
+  // 当前流式请求的 AbortController，切换/新建对话时用来中断
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
+  // 全屏查看某条聊天消息的内容
+  const [viewingMessage, setViewingMessage] = useState<ChatMessage | null>(null);
+  // 当前正在执行哪一步（基于 SSE stage_start 事件实时更新）
+  const [currentRunningStepId, setCurrentRunningStepId] = useState<string | null>(null);
+  const [currentRunningStepName, setCurrentRunningStepName] = useState<string>('');
+  // 总步数 / 当前步序号（1-based）
+  const [progressInfo, setProgressInfo] = useState<{ current: number; total: number } | null>(null);
+
+  const abortActiveStream = () => {
+    if (activeAbortControllerRef.current) {
+      try { activeAbortControllerRef.current.abort(); } catch {}
+      activeAbortControllerRef.current = null;
+    }
+  };
 
   const streamSolve = async (payload: {
     question: string;
@@ -170,6 +376,12 @@ export default function App() {
     previewMode?: boolean;
     reasoningEffort?: string;
   }) => {
+    // 创建新 AbortController 并替换之前的（旧的会被 abort）
+    abortActiveStream();
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+    const signal = controller.signal;
+
     const params = new URLSearchParams({ question: payload.question });
 
     if (payload.startStepIndex !== undefined) {
@@ -200,6 +412,7 @@ export default function App() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal,
     });
 
     if (payload.baseStages?.length) {
@@ -209,11 +422,12 @@ export default function App() {
     const getUrl = `http://localhost:8000/api/solve/stream?${params.toString()}`;
 
     try {
-      const getResponse = await fetch(getUrl);
+      const getResponse = await fetch(getUrl, { signal });
       if (getResponse.status !== 414 && getResponse.status !== 431 && getResponse.status !== 405) {
         return getResponse;
       }
-    } catch {
+    } catch (err: any) {
+      if (err?.name === 'AbortError') throw err;
       // 如果短 GET 仍被浏览器或代理拒绝，再尝试 POST body。
     }
 
@@ -525,13 +739,23 @@ export default function App() {
 
   const buildMetricTitle = (step: Subprocess) => {
     const basis = step.metricBasis;
+    const signals = step.healthSignals || {};
     const lines = [
-      basis?.mode === 'measured' ? '影响度：基于上一版与当前版的最终答案差异' : '影响度：基于风险、链路位置和输出健康度估计',
-      `风险度：${step.riskScore ?? Math.round((step.accuracy || 0) * 100)}`,
-      `健康度：${step.healthScore ?? 80}`,
+      basis?.mode === 'measured'
+        ? '【影响度·实测】基于上一版与当前版的最终答案文本差异计算'
+        : '【影响度·预测】首次运行无对照，基于风险/链路位置/健康度的结构化估计',
+      `健康度：${step.healthScore ?? 80}/100（基于真实输出长度、相似度、JSON 解析、重复度等信号）`,
+      `风险度：${step.riskScore ?? '--'}（基于规划级别 + 链路位置 + 关键词命中）`,
     ];
-    if (basis?.finalDelta !== undefined) lines.push(`最终答案变化：${Math.round(basis.finalDelta * 100)}%`);
-    if (basis?.outputDelta !== undefined) lines.push(`本步输出变化：${Math.round(basis.outputDelta * 100)}%`);
+    if (signals.length !== undefined) lines.push(`  · 实际输出：${signals.length} 字符`);
+    if (signals.timeMs !== undefined) lines.push(`  · 实际耗时：${(signals.timeMs / 1000).toFixed(2)}s`);
+    if (signals.inputOutputSimilarity !== undefined) lines.push(`  · 输入输出相似度：${(signals.inputOutputSimilarity * 100).toFixed(1)}%`);
+    if (basis?.finalDelta !== undefined) lines.push(`实测·最终答案变化：${Math.round(basis.finalDelta * 100)}%`);
+    if (basis?.outputDelta !== undefined) lines.push(`实测·本步输出变化：${Math.round(basis.outputDelta * 100)}%`);
+    if (step.healthIssues && step.healthIssues.length > 0) {
+      lines.push('', '⚠ 发现问题：');
+      step.healthIssues.forEach(issue => lines.push(`  · ${issue}`));
+    }
     return lines.join('\n');
   };
 
@@ -606,6 +830,164 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
+  // ============== 对话历史持久化 ==============
+  // 把当前所有可见状态打包成一个 conversation snapshot
+  const buildCurrentSnapshot = (id: string, title: string): ConversationSnapshot => {
+    // 优先使用既有 conversation 的 title（保持稳定），否则用第一条用户消息
+    const existing = conversations.find(c => c.id === id);
+    const firstUserMsg = chatMessages.find(m => m.role === 'user')?.content;
+    const finalTitle = existing?.title || title || firstUserMsg || activeQuestion || '未命名会话';
+    return {
+      id,
+      title: finalTitle.length > 60 ? finalTitle.slice(0, 60) + '...' : finalTitle,
+      question: activeQuestion,
+      timestamp: Date.now(),
+      chatMessages: chatMessages.map(m => ({ ...m, timestamp: m.timestamp })),
+      subprocesses: subprocesses.map(s => ({ ...s })),
+      modificationHistory: modificationHistory.map(h => ({ ...h, stages: h.stages.map(s => ({ ...s })) })),
+      treePromptDrafts: { ...treePromptDrafts },
+      activeQuestion,
+    };
+  };
+
+  // 自动保存当前会话到列表（如果有内容）
+  const saveCurrentToHistory = (overrideId?: string) => {
+    if (chatMessages.length === 0 && subprocesses.length === 0) return; // 空会话不存
+    const id = overrideId || activeConversationId || generateConversationId();
+    const snapshot = buildCurrentSnapshot(id, '');
+    setConversations(prev => {
+      const filtered = prev.filter(c => c.id !== id);
+      const next = [snapshot, ...filtered];
+      persistConversations(next);
+      return next;
+    });
+    if (!activeConversationId) {
+      setActiveConversationId(id);
+      try { localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, id); } catch {}
+    }
+
+    // 异步生成 AI 标题（仅当 conversation 还没被 AI 生成过 / 用户没手动改过 标题）
+    const firstUserMsg = chatMessages.find(m => m.role === 'user')?.content;
+    const existing = conversations.find(c => c.id === id);
+    const needsAITitle =
+      firstUserMsg &&
+      firstUserMsg.length > 14 &&
+      !existing?.titleLocked && // 用户改过名字就不再覆盖
+      !existing?.aiTitleGenerated; // 已经生成过就不再调
+    if (needsAITitle) {
+      generateAITitle(firstUserMsg).then(aiTitle => {
+        if (!aiTitle) return;
+        setConversations(prev => {
+          const next = prev.map(c =>
+            c.id === id
+              ? { ...c, title: aiTitle, aiTitleGenerated: true }
+              : c
+          );
+          persistConversations(next);
+          return next;
+        });
+      });
+    }
+  };
+
+  // 重命名对话
+  const renameConversation = (id: string, newTitle: string) => {
+    const trimmed = newTitle.trim();
+    if (!trimmed) return;
+    setConversations(prev => {
+      const next = prev.map(c =>
+        c.id === id ? { ...c, title: trimmed, titleLocked: true } : c
+      );
+      persistConversations(next);
+      return next;
+    });
+  };
+
+  // 每次 chatMessages / subprocesses / modificationHistory 变化时，防抖式自动保存
+  useEffect(() => {
+    if (chatMessages.length === 0 && subprocesses.length === 0) return;
+    const t = setTimeout(() => saveCurrentToHistory(), 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatMessages, subprocesses, modificationHistory, treePromptDrafts]);
+
+  // 加载某条历史对话
+  const loadConversation = (id: string) => {
+    const conv = conversations.find(c => c.id === id);
+    if (!conv) return;
+    // 先取消进行中的流式请求，避免数据写到错误的会话
+    abortActiveStream();
+    setIsLoading(false);
+    // 先把当前状态保存（如果还没保存）
+    if (activeConversationId && activeConversationId !== id) {
+      saveCurrentToHistory(activeConversationId);
+    }
+    setActiveConversationId(id);
+    try { localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, id); } catch {}
+    setChatMessages(conv.chatMessages || []);
+    setSubprocesses(conv.subprocesses || []);
+    setModificationHistory(conv.modificationHistory || []);
+    setTreePromptDrafts(conv.treePromptDrafts || {});
+    setActiveQuestion(conv.activeQuestion || conv.question || '');
+    // 清理编辑/试运行临时状态
+    setEditingStepId(null);
+    setSelectedStepId(null);
+    setExpandedStepId(null);
+    setTreePreviewResults([]);
+    setTreePreviewFinalOutput('');
+    clearTreeSnapshot();
+    setTreeResetSignal(prev => prev + 1);
+    setError(null);
+  };
+
+  // 删除某条历史
+  const deleteConversation = (id: string) => {
+    setConversations(prev => {
+      const next = prev.filter(c => c.id !== id);
+      persistConversations(next);
+      return next;
+    });
+    if (activeConversationId === id) {
+      abortActiveStream();
+      setIsLoading(false);
+      setActiveConversationId(null);
+      try { localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY); } catch {}
+      // 清空当前界面
+      setChatMessages([]);
+      setSubprocesses([]);
+      setModificationHistory([]);
+      setTreePromptDrafts({});
+      setActiveQuestion('');
+      setEditingStepId(null);
+      setSelectedStepId(null);
+    }
+  };
+
+  // 开新对话（保存当前 + 清空）
+  const startNewConversation = () => {
+    abortActiveStream();
+    setIsLoading(false);
+    if (chatMessages.length > 0 || subprocesses.length > 0) {
+      saveCurrentToHistory(activeConversationId || undefined);
+    }
+    const newId = generateConversationId();
+    setActiveConversationId(newId);
+    try { localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, newId); } catch {}
+    setChatMessages([]);
+    setSubprocesses([]);
+    setModificationHistory([]);
+    setTreePromptDrafts({});
+    setActiveQuestion('');
+    setEditingStepId(null);
+    setSelectedStepId(null);
+    setExpandedStepId(null);
+    setTreePreviewResults([]);
+    setTreePreviewFinalOutput('');
+    clearTreeSnapshot();
+    setTreeResetSignal(prev => prev + 1);
+    setError(null);
+  };
+
   useEffect(() => {
     if (!selectedStepId) return;
     stepCardRefs.current[selectedStepId]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -613,83 +995,142 @@ export default function App() {
 
   const parseSSEResponse = async (reader: ReadableStreamDefaultReader, modifiedStepIndex: number | null = null) => {
     const decoder = new TextDecoder();
+    let buffer = '';
     let finalOutput = '';
-    let allData = '';
+    let totalSteps = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      allData += decoder.decode(value, { stream: true });
-    }
-
-    // 解析所有事件
-    const eventBlocks = allData.split('\n\n');
-    
-    for (const block of eventBlocks) {
+    // 处理一个完整的 SSE 事件块
+    const dispatchBlock = (block: string) => {
       const lines = block.split('\n');
       let eventType = '';
       let eventData = '';
-      
       for (const line of lines) {
-        if (line.startsWith('event:')) {
-          eventType = line.slice(6).trim();
-        } else if (line.startsWith('data:')) {
-          eventData = line.slice(5).trim();
-        }
+        if (line.startsWith('event:')) eventType = line.slice(6).trim();
+        else if (line.startsWith('data:')) eventData = line.slice(5).trim();
       }
-      
-      if (!eventData) continue;
-      
+      if (!eventData) return;
+
+      let data: any;
       try {
-        const data = JSON.parse(eventData);
+        data = JSON.parse(eventData);
+      } catch {
+        console.error('解析事件数据失败:', eventData.slice(0, 200));
+        return;
+      }
 
-        if (eventType === 'api_error') {
-          throw new Error(formatApiErrorMessage(data.error));
+      if (eventType === 'api_error') {
+        throw new Error(formatApiErrorMessage(data.error));
+      }
+
+      // 规划完成 → 知道总步数和初步骨架
+      if (eventType === 'plan_complete' && Array.isArray(data.subprocesses)) {
+        totalSteps = data.subprocesses.length;
+        setProgressInfo({ current: 0, total: totalSteps });
+        // 初始化骨架（让 UI 立即显示有几步要跑）
+        setSubprocesses(prev => {
+          if (prev.length > 0 && modifiedStepIndex !== null) return prev; // 重算时保留前几步
+          return data.subprocesses.map((s: any, idx: number) => ({
+            id: s.id,
+            name: s.name,
+            description: '',
+            input: '',
+            output: '',
+            timeMs: 0,
+            accuracy: 0,
+            riskLevel: s.risk_level || 'medium',
+            riskScore: s.riskScore,
+            health: 'green' as const,
+            healthScore: 0,
+            healthIssues: [],
+            order: idx + 1,
+            systemPrompt: s.systemPrompt || '',
+            userPrompt: s.userPrompt || '',
+          }));
+        });
+        return;
+      }
+
+      // 阶段开始 → 实时显示"正在跑哪一步"
+      if (eventType === 'stage_start') {
+        setCurrentRunningStepId(data.stageId || null);
+        setCurrentRunningStepName(data.name || '');
+        setProgressInfo({ current: data.order || 0, total: totalSteps || data.order || 0 });
+        return;
+      }
+
+      // 阶段完成 → 流式更新该步骤的真实数据
+      if (eventType === 'stage_complete' && data.stage) {
+        setSubprocesses(prev => {
+          const idx = prev.findIndex(s => s.id === data.stage.id);
+          if (idx >= 0) {
+            const newList = [...prev];
+            newList[idx] = data.stage;
+            return newList;
+          }
+          return [...prev, data.stage];
+        });
+        setCurrentRunningStepId(null);
+        return;
+      }
+
+      // 全部完成
+      if (eventType === 'complete' && data.stages && typeof data.finalOutput === 'string') {
+        finalOutput = data.finalOutput;
+        const fullOutput: string =
+          (typeof data.finalOutputFull === 'string' && data.finalOutputFull.trim())
+            ? data.finalOutputFull
+            : '';
+        const allStagesOutput: string =
+          (typeof data.allStagesOutput === 'string' && data.allStagesOutput.trim())
+            ? data.allStagesOutput
+            : '';
+        const completedStages: Subprocess[] =
+          modifiedStepIndex !== null && data.stages.length < subprocesses.length
+            ? [...subprocesses.slice(0, modifiedStepIndex), ...data.stages]
+            : data.stages;
+
+        setSubprocesses(completedStages);
+        setCurrentRunningStepId(null);
+        setCurrentRunningStepName('');
+        setProgressInfo(null);
+
+        setChatMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: finalOutput,
+          fullContent: fullOutput || finalOutput,
+          allStagesContent: allStagesOutput,
+          timestamp: new Date(),
+        }]);
+
+        setModificationHistory(prev => [...prev, {
+          round: prev.length + 1,
+          modifiedStepIndex: modifiedStepIndex ?? -1,
+          stages: completedStages,
+          timestamp: Date.now(),
+        }]);
+      }
+    };
+
+    // 真正的流式：边读边分块解析
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        // 兜底：处理 buffer 里残留的最后一块
+        if (buffer.trim()) {
+          for (const block of buffer.split('\n\n')) {
+            if (block.trim()) dispatchBlock(block);
+          }
         }
-
-        if (eventType === 'stage_complete' && data.stage) {
-          setSubprocesses(prev => {
-            const idx = prev.findIndex(s => s.id === data.stage.id);
-            if (idx >= 0) {
-              const newList = [...prev];
-              newList[idx] = data.stage;
-              return newList;
-            }
-            return [...prev, data.stage];
-          });
-        }
-
-        if (eventType === 'complete' && data.stages && typeof data.finalOutput === 'string') {
-          finalOutput = data.finalOutput;
-          const completedStages: Subprocess[] =
-            modifiedStepIndex !== null && data.stages.length < subprocesses.length
-              ? [...subprocesses.slice(0, modifiedStepIndex), ...data.stages]
-              : data.stages;
-
-          setSubprocesses(completedStages);
-
-          setChatMessages(prev => [...prev, {
-            id: Date.now().toString(),
-            role: 'assistant',
-            content: finalOutput,
-            timestamp: new Date()
-          }]);
-
-          // 记录Prompt历史
-          setModificationHistory(prev => [...prev, {
-            round: prev.length + 1,
-            modifiedStepIndex: modifiedStepIndex ?? -1,
-            stages: completedStages,
-            timestamp: Date.now(),
-          }]);
-          return;
-        }
-      } catch (err) {
-        if (eventType === 'api_error') {
-          throw err;
-        }
-        console.error('解析事件数据失败:', err);
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      // 按 SSE 协议，事件以 \n\n 分隔
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        if (block.trim()) dispatchBlock(block);
       }
     }
   };
@@ -747,6 +1188,15 @@ export default function App() {
 
       await parseSSEResponse(reader);
     } catch (err: any) {
+      // 清理进度状态
+      setCurrentRunningStepId(null);
+      setCurrentRunningStepName('');
+      setProgressInfo(null);
+      // 用户主动中断（切换/新建对话），不算错误
+      if (err?.name === 'AbortError') {
+        console.log('流式请求已被用户取消');
+        return;
+      }
       console.error('提交失败:', err);
       setError(err.message || '提交失败');
       setChatMessages(prev => [...prev, {
@@ -817,6 +1267,14 @@ export default function App() {
       setEditedUserTemplate('');
       setEditedInput('');
     } catch (err: any) {
+      // 清理进度状态
+      setCurrentRunningStepId(null);
+      setCurrentRunningStepName('');
+      setProgressInfo(null);
+      if (err?.name === 'AbortError') {
+        console.log('重算已被取消');
+        return;
+      }
       console.error('确认提交失败:', err);
       setError(err.message || '确认提交失败');
     } finally {
@@ -855,21 +1313,6 @@ export default function App() {
     setEditedInput('');
   };
 
-  const clearChat = () => {
-    setChatMessages([]);
-    setSubprocesses([]);
-    setEditingStepId(null);
-    setSelectedStepId(null);
-    setExpandedStepId(null);
-    setModificationHistory([]);
-    setActiveQuestion('');
-    setTreePromptDrafts({});
-    setTreePreviewResults([]);
-    setTreePreviewFinalOutput('');
-    clearTreeSnapshot();
-    setTreeResetSignal(prev => prev + 1);
-  };
-
   const expandedStep = expandedStepId
     ? subprocesses.find(step => step.id === expandedStepId) || null
     : null;
@@ -893,7 +1336,7 @@ export default function App() {
             <h1 className="text-base font-bold text-slate-800">AI Agent 动态推理</h1>
           </div>
           <button
-            onClick={clearChat}
+            onClick={startNewConversation}
             className="px-3 py-1.5 text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
           >
             新对话
@@ -907,14 +1350,13 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Content - 新布局：左侧（右上卡片+左下占位）+ 右侧对话 */}
+      {/* Main Content - 4 面板 grid 布局，统一 gap-3 间距，去掉 border 分隔 */}
       <div className="flex-1 flex overflow-hidden">
-        {/* 左侧区域 - 其他功能（左边）+ 决策子过程（右边） */}
-        <div className="flex-1 flex bg-slate-100 overflow-hidden">
-          {/* 左边：其他功能区域 - 上下布局 */}
-          <div className="w-1/3 flex flex-col">
-            {/* 上部分：目标-子过程树 */}
-            <div className="flex-[2] border-r border-slate-200 bg-slate-50 p-4 min-h-0">
+        {/* 左侧工作区：2 列 4 面板，统一间距 */}
+        <div className="flex-1 flex bg-slate-100 overflow-hidden gap-3 p-3">
+          {/* 左列：目标树 + 对话历史 */}
+          <div className="w-1/3 flex flex-col gap-3">
+            <div className="flex-[2] min-h-0">
               <PromptTreePanel
                 goal={activeQuestion || chatMessages.find(m => m.role === 'user')?.content || '等待输入目标'}
                 subprocesses={subprocesses}
@@ -933,16 +1375,22 @@ export default function App() {
                 onUndoPreview={undoTreePreview}
               />
             </div>
-            {/* 下部分：保留空白扩展区 */}
-            <div className="flex-1 border-t border-r border-slate-200 bg-slate-50 p-4 min-h-0">
-              <div className="h-full border-2 border-dashed border-slate-300 rounded-lg bg-white/40" />
+            <div className="flex-1 min-h-0">
+              <ChatHistoryPanel
+                conversations={conversations}
+                activeConversationId={activeConversationId}
+                onSelect={loadConversation}
+                onDelete={deleteConversation}
+                onNew={startNewConversation}
+                onRename={renameConversation}
+              />
             </div>
           </div>
 
-          {/* 右边：决策子过程 - 上下布局 */}
-          <div className="flex-1 flex flex-col">
-            {/* 上部分：决策子过程卡片区域 */}
-            <div className="flex-[2] overflow-hidden p-4">
+          {/* 右列：决策子过程 + 修改历史 */}
+          <div className="flex-1 flex flex-col gap-3 min-w-0">
+            {/* 决策子过程卡片区 */}
+            <div className="flex-[2] min-h-0">
               <div className="h-full bg-white rounded-xl border border-slate-200 shadow-sm flex flex-col overflow-hidden">
               {/* 标题栏 */}
               <div className="px-4 py-3 border-b border-slate-200 flex-shrink-0">
@@ -958,6 +1406,61 @@ export default function App() {
                   )}
                 </h3>
               </div>
+
+              {/* 显眼的加载/重算 banner */}
+              {isLoading && (
+                <div className={clsx(
+                  'flex-shrink-0 px-4 py-3 border-b flex items-center gap-3',
+                  rerunFromStep !== null
+                    ? 'bg-gradient-to-r from-amber-50 via-orange-50 to-amber-50 border-amber-200'
+                    : 'bg-gradient-to-r from-purple-50 via-indigo-50 to-purple-50 border-purple-200'
+                )}>
+                  {/* 转圈 */}
+                  <div className={clsx(
+                    'w-7 h-7 rounded-full border-[3px] border-t-transparent animate-spin flex-shrink-0',
+                    rerunFromStep !== null ? 'border-amber-500' : 'border-purple-500'
+                  )} />
+                  <div className="flex-1 min-w-0">
+                    <div className={clsx(
+                      'text-sm font-semibold flex items-center gap-2',
+                      rerunFromStep !== null ? 'text-amber-700' : 'text-purple-700'
+                    )}>
+                      {rerunFromStep !== null ? '🔄 正在重算' : '⚡ 正在推理'}
+                      {progressInfo && progressInfo.total > 0 && (
+                        <span className={clsx(
+                          'text-xs px-2 py-0.5 rounded-full',
+                          rerunFromStep !== null ? 'bg-amber-100 text-amber-700' : 'bg-purple-100 text-purple-700'
+                        )}>
+                          {progressInfo.current}/{progressInfo.total}
+                        </span>
+                      )}
+                    </div>
+                    <div className={clsx(
+                      'text-xs mt-0.5 truncate',
+                      rerunFromStep !== null ? 'text-amber-600' : 'text-purple-600'
+                    )}>
+                      {currentRunningStepName
+                        ? `当前：${currentRunningStepName}`
+                        : (rerunFromStep !== null ? '准备从所选步骤开始重新推理...' : '正在规划推理步骤...')}
+                    </div>
+                    {/* 进度条 */}
+                    {progressInfo && progressInfo.total > 0 && (
+                      <div className={clsx(
+                        'mt-1.5 h-1 w-full rounded-full overflow-hidden',
+                        rerunFromStep !== null ? 'bg-amber-100' : 'bg-purple-100'
+                      )}>
+                        <div
+                          className={clsx(
+                            'h-full transition-all duration-500 ease-out',
+                            rerunFromStep !== null ? 'bg-amber-500' : 'bg-purple-500'
+                          )}
+                          style={{ width: `${Math.min(100, (progressInfo.current / Math.max(progressInfo.total, 1)) * 100)}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
 
               {/* 卡片区域（可滚动） */}
               <div className="flex-1 overflow-y-auto p-4">
@@ -988,6 +1491,10 @@ export default function App() {
                     const isDirty = isEditing && hasEditChanges(sub);
                     const metricTitle = buildMetricTitle(sub);
                     const isRerunning = isLoading && rerunFromStep !== null && idx >= rerunFromStep;
+                    // 是否是当前正在执行的那一步（基于 SSE stage_start 实时更新）
+                    const isCurrentlyRunning = currentRunningStepId === sub.id;
+                    // 待重算（属于重算范围但还没轮到的）
+                    const isPendingRerun = isRerunning && !isCurrentlyRunning && currentRunningStepId !== null;
 
                     return (
                       <div
@@ -995,12 +1502,26 @@ export default function App() {
                         ref={(node) => { stepCardRefs.current[sub.id] = node; }}
                         onClick={() => setSelectedStepId(sub.id)}
                         className={clsx(
-                          'rounded-lg border transition-all flex flex-col cursor-pointer',
-                          isEditing ? 'border-purple-400 bg-purple-50 shadow-lg' :
-                            isSelected ? 'border-red-400 bg-red-50 shadow-md shadow-red-100' :
-                              'border-slate-200 bg-white hover:border-slate-300'
+                          'rounded-lg border-2 transition-all flex flex-col cursor-pointer relative',
+                          isCurrentlyRunning ? 'border-purple-500 bg-gradient-to-br from-purple-50 to-indigo-50 shadow-xl shadow-purple-200 ring-2 ring-purple-300/40 animate-pulse' :
+                            isPendingRerun ? 'border-amber-300 bg-amber-50/50 opacity-70' :
+                              isEditing ? 'border-purple-400 bg-purple-50 shadow-lg' :
+                                isSelected ? 'border-red-400 bg-red-50 shadow-md shadow-red-100' :
+                                  'border-slate-200 bg-white hover:border-slate-300'
                         )}
                       >
+                        {/* 当前执行步骤的角标 */}
+                        {isCurrentlyRunning && (
+                          <div className="absolute -top-1.5 -right-1.5 z-10 flex items-center gap-1 px-2 py-0.5 rounded-full bg-purple-500 text-white text-[10px] font-bold shadow-md">
+                            <span className="w-1.5 h-1.5 bg-white rounded-full animate-ping" />
+                            执行中
+                          </div>
+                        )}
+                        {isPendingRerun && (
+                          <div className="absolute -top-1.5 -right-1.5 z-10 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-medium border border-amber-300">
+                            待重算
+                          </div>
+                        )}
                         {/* 卡片头部 */}
                         <div className="px-3 py-2 flex items-center justify-between flex-shrink-0">
                           <div className="flex items-center gap-2">
@@ -1052,12 +1573,44 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* 指标 */}
-                        <div className="px-3 pb-2 flex items-center gap-3 text-xs text-slate-400 flex-shrink-0" title={metricTitle}>
-                          <span>影响度: <span className={clsx('font-semibold', risk.text)}>{(sub.accuracy * 100).toFixed(0)}%</span></span>
-                          <span>健康: <span className={clsx('font-semibold', healthTextColor[sub.health] || 'text-slate-500')}>{sub.healthScore || 80}</span></span>
-                          <span>风险: <span className={clsx('font-semibold', risk.text)}>{sub.riskScore ?? '--'}</span></span>
-                          {isRerunning && <span className="text-purple-500 font-medium">重算中</span>}
+                        {/* 指标 - 显示真实数据 + 数据来源徽章 */}
+                        <div className="px-3 pb-2 flex flex-col gap-1 flex-shrink-0">
+                          <div className="flex items-center gap-3 text-xs text-slate-400 flex-wrap" title={metricTitle}>
+                            <span className="flex items-center gap-1">
+                              影响度: <span className={clsx('font-semibold', risk.text)}>{(sub.accuracy * 100).toFixed(0)}%</span>
+                              <span
+                                className={clsx(
+                                  'text-[9px] px-1 py-0.5 rounded font-medium border',
+                                  sub.metricBasis?.mode === 'measured'
+                                    ? 'bg-emerald-50 text-emerald-600 border-emerald-200'
+                                    : 'bg-slate-100 text-slate-500 border-slate-200'
+                                )}
+                                title={
+                                  sub.metricBasis?.mode === 'measured'
+                                    ? '实测：基于上一版与当前版的最终答案差异计算'
+                                    : '预测：首次运行时基于风险/位置/健康度的结构化估算'
+                                }
+                              >
+                                {sub.metricBasis?.mode === 'measured' ? '实测' : '预测'}
+                              </span>
+                            </span>
+                            <span>健康: <span className={clsx('font-semibold', healthTextColor[sub.health] || 'text-slate-500')}>{sub.healthScore || 80}</span></span>
+                            <span>风险: <span className={clsx('font-semibold', risk.text)}>{sub.riskScore ?? '--'}</span></span>
+                            {isRerunning && (
+                              <span className="text-purple-500 font-medium flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 bg-purple-500 rounded-full animate-pulse" />
+                                重算中
+                              </span>
+                            )}
+                          </div>
+                          {/* 真实可观测信号 - 数字直接来自运行时 */}
+                          {sub.healthSignals && (
+                            <div className="flex items-center gap-2.5 text-[10px] text-slate-400">
+                              <span title="实际输出字符数">📝 {sub.healthSignals.length ?? 0}字</span>
+                              <span title="实际 API 调用耗时">⏱ {((sub.healthSignals.timeMs ?? 0) / 1000).toFixed(1)}s</span>
+                              <span title="输入与输出文本相似度（bigram Jaccard）">↔ {((sub.healthSignals.inputOutputSimilarity ?? 0) * 100).toFixed(0)}%</span>
+                            </div>
+                          )}
                         </div>
 
                         {/* 内容区域（可滚动） */}
@@ -1168,37 +1721,47 @@ export default function App() {
             </div>
           </div>
 
-          {/* 右边下部分：修改历史折线图 */}
-          <div className="flex-1 border-t border-slate-200 bg-slate-50 p-2">
-            <div className="h-full bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden flex flex-col">
-              <div className="px-3 py-2 border-b border-slate-200 flex-shrink-0">
-                <h3 className="text-xs font-semibold text-slate-700 flex items-center gap-2">
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z" />
-                  </svg>
-                  修改历史
-                  {modificationHistory.length > 0 && (
-                    <span className="ml-1 text-xs bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded-full">
-                      {modificationHistory.length}次
-                    </span>
-                  )}
-                </h3>
-              </div>
-              <div className="flex-1 min-h-0">
-                <ModificationFlow
-                  modificationHistory={modificationHistory}
-                  onSelectPoint={handleSelectFromFlow}
-                />
+            {/* 修改历史 - 与上面统一为 rounded-xl + 一致标题栏 */}
+            <div className="flex-1 min-h-0">
+              <div className="h-full bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
+                <div className="px-4 py-3 border-b border-slate-200 flex-shrink-0">
+                  <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z" />
+                    </svg>
+                    修改历史
+                    {modificationHistory.length > 0 && (
+                      <span className="ml-1 text-xs bg-purple-100 text-purple-600 px-2 py-0.5 rounded-full">
+                        {modificationHistory.length}次
+                      </span>
+                    )}
+                  </h3>
+                </div>
+                <div className="flex-1 min-h-0">
+                  <ModificationFlow
+                    modificationHistory={modificationHistory}
+                    onSelectPoint={handleSelectFromFlow}
+                  />
+                </div>
               </div>
             </div>
-          </div>
           </div>
         </div>
 
         {/* 右侧对话框区域 */}
         <div className="w-96 bg-white border-l border-slate-200 flex flex-col overflow-hidden">
-          <div className="px-4 py-3 border-b border-slate-100 bg-slate-50">
-            <h3 className="text-sm font-semibold text-slate-700">对话</h3>
+          <div className="px-4 py-3 border-b border-slate-200 bg-slate-50 flex items-center justify-between flex-shrink-0">
+            <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+              </svg>
+              对话
+              {chatMessages.length > 0 && (
+                <span className="ml-1 text-xs bg-purple-100 text-purple-600 px-2 py-0.5 rounded-full">
+                  {chatMessages.length}
+                </span>
+              )}
+            </h3>
           </div>
 
           {/* 消息列表 */}
@@ -1209,33 +1772,108 @@ export default function App() {
               </div>
             )}
 
-            {chatMessages.map((msg) => (
-              <div key={msg.id} className={clsx('flex', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
-                <div
-                  className={clsx(
-                    'max-w-[90%] rounded-2xl px-4 py-3',
-                    msg.role === 'user'
-                      ? 'bg-purple-500 text-white rounded-br-sm'
-                      : 'bg-slate-100 text-slate-700 rounded-bl-sm'
-                  )}
-                >
-                  <div className="text-sm whitespace-pre-wrap break-words max-h-none overflow-visible">
-                    {msg.content}
-                  </div>
-                  <div className={clsx('text-xs mt-1', msg.role === 'user' ? 'text-purple-200' : 'text-slate-400')}>
-                    {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            {chatMessages.map((msg) => {
+              // 助手消息：用户希望看到完整内容（包含未提取的原文 + 所有步骤输出）
+              // 用户消息：超 100 字也提供展开（方便回看长问题）
+              const displayLen = (msg.content || '').length;
+              // 比较所有可用版本，取最长的作为"完整字数"
+              const candidateLens = [
+                displayLen,
+                (msg.fullContent || '').length,
+                (msg.allStagesContent || '').length,
+              ];
+              const fullLen = Math.max(...candidateLens);
+              const hasMoreContent = fullLen > displayLen + 20;
+              const showExpandButton = msg.role === 'assistant' || displayLen > 100;
+              return (
+                <div key={msg.id} className={clsx('flex', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+                  <div
+                    className={clsx(
+                      'max-w-[90%] rounded-2xl px-4 py-3',
+                      msg.role === 'user'
+                        ? 'bg-purple-500 text-white rounded-br-sm'
+                        : 'bg-slate-100 text-slate-700 rounded-bl-sm'
+                    )}
+                  >
+                    <div className="text-sm whitespace-pre-wrap break-words max-h-none overflow-visible">
+                      {msg.content}
+                    </div>
+                    <div className={clsx('flex items-center justify-between gap-2 mt-2 pt-1.5 border-t', msg.role === 'user' ? 'text-purple-200 border-white/20' : 'text-slate-400 border-slate-200')}>
+                      <span className="text-xs">
+                        {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px]">
+                          {hasMoreContent ? `${displayLen}/${fullLen} 字` : `${displayLen} 字`}
+                        </span>
+                        {showExpandButton && (
+                          <button
+                            onClick={() => setViewingMessage(msg)}
+                            className={clsx(
+                              'px-2 py-0.5 rounded text-[10px] font-medium border transition-colors flex items-center gap-1',
+                              msg.role === 'user'
+                                ? 'bg-white/20 text-white border-white/30 hover:bg-white/30'
+                                : 'bg-white text-slate-600 border-slate-300 hover:bg-purple-50 hover:text-purple-600 hover:border-purple-300'
+                            )}
+                            title={hasMoreContent ? '查看包含全部步骤输出的完整视图（推荐，可看 AI 全部产出）' : '在弹窗中查看完整内容（支持复制）'}
+                          >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                            </svg>
+                            {hasMoreContent ? '查看全部输出' : '展开查看'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
 
             {isLoading && (
               <div className="flex justify-start">
-                <div className="bg-slate-100 rounded-2xl rounded-bl-sm px-4 py-3">
-                  <div className="flex items-center gap-1">
-                    <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                    <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                    <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                <div className={clsx(
+                  'rounded-2xl rounded-bl-sm px-4 py-3 max-w-[90%]',
+                  rerunFromStep !== null
+                    ? 'bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200'
+                    : 'bg-gradient-to-r from-purple-50 to-indigo-50 border border-purple-200'
+                )}>
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1">
+                      <div className={clsx(
+                        'w-2 h-2 rounded-full animate-bounce',
+                        rerunFromStep !== null ? 'bg-amber-500' : 'bg-purple-500'
+                      )} style={{ animationDelay: '0ms' }} />
+                      <div className={clsx(
+                        'w-2 h-2 rounded-full animate-bounce',
+                        rerunFromStep !== null ? 'bg-amber-500' : 'bg-purple-500'
+                      )} style={{ animationDelay: '150ms' }} />
+                      <div className={clsx(
+                        'w-2 h-2 rounded-full animate-bounce',
+                        rerunFromStep !== null ? 'bg-amber-500' : 'bg-purple-500'
+                      )} style={{ animationDelay: '300ms' }} />
+                    </div>
+                    <div className="text-xs">
+                      <div className={clsx(
+                        'font-semibold',
+                        rerunFromStep !== null ? 'text-amber-700' : 'text-purple-700'
+                      )}>
+                        {rerunFromStep !== null ? '🔄 重算中' : '⚡ 推理中'}
+                        {progressInfo && progressInfo.total > 0 && (
+                          <span className="ml-1.5 font-normal">
+                            （{progressInfo.current}/{progressInfo.total}）
+                          </span>
+                        )}
+                      </div>
+                      {currentRunningStepName && (
+                        <div className={clsx(
+                          'mt-0.5 truncate',
+                          rerunFromStep !== null ? 'text-amber-600' : 'text-purple-600'
+                        )}>
+                          {currentRunningStepName}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1348,6 +1986,19 @@ export default function App() {
               </section>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 聊天消息全屏查看 */}
+      {viewingMessage && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 px-6 py-8"
+          onClick={() => setViewingMessage(null)}
+        >
+          <ViewingMessageModal
+            msg={viewingMessage}
+            onClose={() => setViewingMessage(null)}
+          />
         </div>
       )}
     </div>

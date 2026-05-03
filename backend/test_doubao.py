@@ -6,7 +6,13 @@ import httpx
 import json
 
 import os
-API_KEY = os.getenv("ARK_API_KEY", "ark-a5594092-1603-42bb-9712-36a670b45718-36ecd")
+API_KEY = os.getenv("ARK_API_KEY", "")
+if not API_KEY:
+    raise SystemExit(
+        "请先设置环境变量 ARK_API_KEY，例如：\n"
+        '  PowerShell:  $env:ARK_API_KEY = "你的Key"; python test_doubao.py\n'
+        '  CMD:         set ARK_API_KEY=你的Key && python test_doubao.py'
+    )
 BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 MODEL = "doubao-seed-1-6-251015"  # 直接用模型名（火山方舟文档推荐方式）
 

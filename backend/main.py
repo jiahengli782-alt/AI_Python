@@ -5,11 +5,12 @@ AI Agent 推理可视化系统后端
 2. 准确率新定义：子过程对最终结果的影响程度（风险值）
 3. 真实数据收集：从实际API调用获取耗时和准确率
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any, Tuple
+from contextvars import ContextVar
 import httpx
 import asyncio
 import time
@@ -19,21 +20,54 @@ import json
 import re
 import os
 
+# 当前请求上下文里的 API Key / 模型 ID（每个请求独立）
+_request_api_key: ContextVar[Optional[str]] = ContextVar("request_api_key", default=None)
+_request_model: ContextVar[Optional[str]] = ContextVar("request_model", default=None)
+
+
+def get_active_api_key() -> str:
+    """优先使用请求里带的，没带就用全局默认"""
+    key = _request_api_key.get() or DEFAULT_DOUBAO_API_KEY
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="缺少 API Key：请在前端右上角'设置'里填入你的火山方舟 API Key（或在服务器设置 ARK_API_KEY 环境变量）"
+        )
+    return key
+
+
+def get_active_model() -> str:
+    return _request_model.get() or DEFAULT_MODEL_NAME or "doubao-seed-1-6-251015"
+
 app = FastAPI(title="Agent Visualizer API")
 
-# CORS配置
+# CORS 配置
+# 部署时可以用 ALLOWED_ORIGINS 环境变量收紧到具体域名（逗号分隔），默认 * 方便开发
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "*")
+_allowed_origins = (
+    ["*"] if _allowed_origins_env.strip() == "*"
+    else [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allowed_origins,
+    # allow_credentials 在 origin=* 时会被浏览器忽略，前端用 header 传 key 不依赖 cookie
+    allow_credentials=False if _allowed_origins == ["*"] else True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Ark-Api-Key", "X-Ark-Model"],
 )
 
-# 豆包API配置
-DOUBAO_API_KEY = os.getenv("ARK_API_KEY", "ark-a5594092-1603-42bb-9712-36a670b45718-36ecd")
-DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-MODEL_NAME = os.getenv("DOUBAO_MODEL_NAME", "ep-m-20260414114056-685z2")
+# 豆包 API 配置（按优先级使用）：
+#   1. 请求头 X-Ark-Api-Key / X-Ark-Model（用户在前端"设置"里填的）
+#   2. 环境变量 ARK_API_KEY / DOUBAO_MODEL_NAME（部署者在服务器上配的）
+#   3. 下面写死的 fallback（仅本地开发用，部署到公网时建议清空避免被盗用额度）
+DEFAULT_DOUBAO_API_KEY = os.getenv("ARK_API_KEY", "")
+DEFAULT_MODEL_NAME = os.getenv("DOUBAO_MODEL_NAME", "doubao-seed-1-6-251015")
+DOUBAO_BASE_URL = os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+
+# 兼容旧代码的引用
+DOUBAO_API_KEY = DEFAULT_DOUBAO_API_KEY
+MODEL_NAME = DEFAULT_MODEL_NAME
 
 # ==================== 问题分类系统 ====================
 
@@ -413,16 +447,15 @@ async def call_doubao_api(
     max_tokens: Optional[int] = None,
     reasoning_effort: str = "medium"
 ) -> Tuple[str, float]:
-    """调用豆包API (doubao-seed-1-6-251015)"""
+    """调用豆包 API。API Key/Model 从当前请求上下文取（前端传的优先，回退到环境变量）"""
+    api_key = get_active_api_key()  # 抛 400 如果没有 key
+    model_name = get_active_model()
     headers = {
-        "Authorization": f"Bearer {DOUBAO_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    # 默认上限收紧到 8192：足够覆盖单个推理步骤的 JSON 输出，
-    # 同时减少模型"放飞自我"导致的长尾输出耗时。
-    # 65535 是模型理论上限，但实际单步推理用不到那么多，反而拖慢响应。
     payload = {
-        "model": MODEL_NAME,
+        "model": model_name,
         "messages": messages,
         "reasoning_effort": reasoning_effort,
         "max_completion_tokens": max_tokens if max_tokens else 8192,
@@ -849,7 +882,9 @@ async def generate_solve_events(
     modified_steps: dict = None,
     base_stages: Optional[List[Dict[str, Any]]] = None,
     preview_mode: bool = False,
-    reasoning_effort: str = "medium"
+    reasoning_effort: str = "medium",
+    api_key: Optional[str] = None,
+    model_name: Optional[str] = None,
 ):
     """生成SSE事件流
 
@@ -860,7 +895,35 @@ async def generate_solve_events(
         modified_steps: 修改后的步骤配置，格式为 {step_id: {"systemPrompt": ..., "userPromptTemplate": ..., "input": ...}}
         base_stages: 上一版完整步骤，用于固定规划并做版本差异测量
         preview_mode: 树状图试运行模式，使用较短上下文和输出，且不写入正式会话/历史
+        api_key: 本次请求使用的 API Key（前端传，覆盖默认值）
+        model_name: 本次请求使用的模型 ID（前端传，覆盖默认值）
     """
+    # 把请求级别的 key/model 注入到 ContextVar，让 call_doubao_api 自动取到
+    token_key = _request_api_key.set(api_key) if api_key else None
+    token_model = _request_model.set(model_name) if model_name else None
+    try:
+        async for chunk in _generate_solve_events_inner(
+            question, start_step_index, modified_outputs, modified_steps,
+            base_stages, preview_mode, reasoning_effort
+        ):
+            yield chunk
+    finally:
+        if token_key is not None:
+            _request_api_key.reset(token_key)
+        if token_model is not None:
+            _request_model.reset(token_model)
+
+
+async def _generate_solve_events_inner(
+    question: str,
+    start_step_index: int = 0,
+    modified_outputs: dict = None,
+    modified_steps: dict = None,
+    base_stages: Optional[List[Dict[str, Any]]] = None,
+    preview_mode: bool = False,
+    reasoning_effort: str = "medium"
+):
+    """SSE 事件生成器（内层），由 generate_solve_events 包裹注入 ContextVar"""
     execution_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now().isoformat()
 
@@ -1248,7 +1311,11 @@ async def solve_stream(
     baseStages: str = None,
     useSessionBase: bool = False,
     previewMode: bool = False,
-    reasoningEffort: str = "medium"
+    reasoningEffort: str = "medium",
+    apiKey: Optional[str] = None,
+    model: Optional[str] = None,
+    x_ark_api_key: Optional[str] = Header(None, alias="X-Ark-Api-Key"),
+    x_ark_model: Optional[str] = Header(None, alias="X-Ark-Model"),
 ):
     """流式执行推理
 
@@ -1290,6 +1357,10 @@ async def solve_stream(
     elif useSessionBase and CURRENT_SESSION.get("question") == question:
         parsed_base_stages = CURRENT_SESSION.get("subprocesses") or None
 
+    # 优先使用请求头里的 key/model（更安全），其次 query param，最后 fallback 到环境变量
+    effective_api_key = x_ark_api_key or apiKey
+    effective_model = x_ark_model or model
+
     return StreamingResponse(
         generate_solve_events(
             question.strip(),
@@ -1298,7 +1369,9 @@ async def solve_stream(
             parsed_step_mods,
             parsed_base_stages,
             previewMode,
-            reasoningEffort
+            reasoningEffort,
+            api_key=effective_api_key,
+            model_name=effective_model,
         ),
         media_type="text/event-stream",
         headers={
@@ -1309,7 +1382,11 @@ async def solve_stream(
     )
 
 @app.post("/api/solve/stream")
-async def solve_stream_post(request: StreamSolveRequest):
+async def solve_stream_post(
+    request: StreamSolveRequest,
+    x_ark_api_key: Optional[str] = Header(None, alias="X-Ark-Api-Key"),
+    x_ark_model: Optional[str] = Header(None, alias="X-Ark-Model"),
+):
     """POST版流式推理。用于提交较长Prompt、输出和完整版本历史，避免URL长度限制。"""
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="Question is required")
@@ -1322,7 +1399,9 @@ async def solve_stream_post(request: StreamSolveRequest):
             request.modifiedSteps,
             request.baseStages,
             request.previewMode,
-            request.reasoningEffort
+            request.reasoningEffort,
+            api_key=x_ark_api_key,
+            model_name=x_ark_model,
         ),
         media_type="text/event-stream",
         headers={
@@ -1474,12 +1553,29 @@ class TitleGenerateRequest(BaseModel):
 
 
 @app.post("/api/title/generate")
-async def generate_title(request: TitleGenerateRequest):
+async def generate_title(
+    request: TitleGenerateRequest,
+    x_ark_api_key: Optional[str] = Header(None, alias="X-Ark-Api-Key"),
+    x_ark_model: Optional[str] = Header(None, alias="X-Ark-Model"),
+):
     """用 minimal 推理把用户问题压成精简标题（8-15 字）
 
     前端在新建会话第一次保存时调用，让侧边栏的对话标题更短更精炼。
     用 minimal 推理 + max_tokens=64，几乎瞬时返回。
     """
+    # 注入请求级别的 key/model
+    token_key = _request_api_key.set(x_ark_api_key) if x_ark_api_key else None
+    token_model = _request_model.set(x_ark_model) if x_ark_model else None
+    try:
+        return await _generate_title_impl(request)
+    finally:
+        if token_key is not None:
+            _request_api_key.reset(token_key)
+        if token_model is not None:
+            _request_model.reset(token_model)
+
+
+async def _generate_title_impl(request: TitleGenerateRequest):
     raw_text = (request.text or "").strip()
     if not raw_text:
         return {"title": "新对话"}
@@ -1518,6 +1614,73 @@ async def generate_title(request: TitleGenerateRequest):
         # AI 生成失败就用前 N 字兜底，不抛错
         print(f"[标题生成失败] {e}")
         return {"title": raw_text[: request.max_length] + ("..." if len(raw_text) > request.max_length else "")}
+
+
+# ==================== API Key 连通性测试 ====================
+
+class TestApiKeyRequest(BaseModel):
+    apiKey: str
+    model: Optional[str] = None
+
+
+@app.post("/api/test-key")
+async def test_api_key(request: TestApiKeyRequest):
+    """测试用户填的 API Key 和模型 ID 是否能成功调用豆包
+
+    返回 status: ok/auth_failed/model_invalid/network_error/quota_exceeded/unknown
+    """
+    test_key = (request.apiKey or "").strip()
+    test_model = (request.model or DEFAULT_MODEL_NAME or "doubao-seed-1-6-251015").strip()
+
+    if not test_key:
+        return {"status": "auth_failed", "message": "API Key 为空", "model": test_model}
+
+    headers = {
+        "Authorization": f"Bearer {test_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": test_model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "minimal",
+        "max_completion_tokens": 16,
+    }
+
+    try:
+        client = get_global_client()
+        start = time.time()
+        response = await client.post(
+            f"{DOUBAO_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        elapsed = round((time.time() - start) * 1000)
+
+        if response.status_code == 200:
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {
+                "status": "ok",
+                "message": f"连通正常（{elapsed}ms）",
+                "model": test_model,
+                "sample_reply": (content or "")[:80],
+            }
+        elif response.status_code == 401:
+            return {"status": "auth_failed", "message": "API Key 无效或未授权", "model": test_model}
+        elif response.status_code == 404:
+            return {"status": "model_invalid", "message": "模型 ID 不存在或未开通", "model": test_model}
+        elif response.status_code == 429:
+            return {"status": "quota_exceeded", "message": "触发限流或额度耗尽", "model": test_model}
+        else:
+            return {
+                "status": "unknown",
+                "message": f"HTTP {response.status_code}: {response.text[:200]}",
+                "model": test_model,
+            }
+    except httpx.ConnectError as e:
+        return {"status": "network_error", "message": f"连不上火山方舟服务器：{e}", "model": test_model}
+    except Exception as e:
+        return {"status": "unknown", "message": f"{type(e).__name__}: {e}", "model": test_model}
 
 
 if __name__ == "__main__":

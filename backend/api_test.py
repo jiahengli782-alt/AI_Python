@@ -7,7 +7,13 @@ import asyncio
 import os
 import socket
 
-API_KEY = "13d7a163-eaaf-4ebd-8cd1-0f444ccbfd24"
+API_KEY = os.getenv("ARK_API_KEY", "")
+if not API_KEY:
+    raise SystemExit(
+        "请先设置环境变量 ARK_API_KEY，例如：\n"
+        '  PowerShell:  $env:ARK_API_KEY = "你的Key"; python api_test.py\n'
+        '  CMD:         set ARK_API_KEY=你的Key && python api_test.py'
+    )
 BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 HOST = "ark.cn-beijing.volces.com"
 

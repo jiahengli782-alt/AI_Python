@@ -1,0 +1,57 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# ===== Node / 前端 =====
+node_modules/
+dist/
+build/
+.next/
+.vite/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== 环境变量 / 密钥 =====
+.env
+.env.local
+.env.*.local
+*.pem
+secrets/
+.api_key
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== 系统临时文件 =====
+*.bak
+*.tmp
+*.old
+*.cache
+
+# ===== 项目本地数据（非源码）=====
+backend/conversations.db
+backend/*.json.local
+frontend/.local/

@@ -3,6 +3,7 @@ import clsx from 'clsx';
 import { ModificationFlow } from './components/ModificationFlow';
 import { PromptTreePanel, type TreePreviewResult } from './components/PromptTreePanel';
 import { ChatHistoryPanel, type ConversationSnapshot } from './components/ChatHistoryPanel';
+import { SettingsModal, loadSettings, saveSettings, type UserSettings } from './components/SettingsModal';
 
 const CONVERSATIONS_STORAGE_KEY = 'agent_conversations_v1';
 const ACTIVE_CONVERSATION_STORAGE_KEY = 'agent_active_conversation_v1';
@@ -165,11 +166,14 @@ function persistConversations(conversations: ConversationSnapshot[]) {
 }
 
 // 调用后端用 AI 生成精简标题，失败就返回 null
-async function generateAITitle(text: string, maxLength = 14): Promise<string | null> {
+async function generateAITitle(text: string, settings: UserSettings, maxLength = 14): Promise<string | null> {
   try {
-    const res = await fetch('http://localhost:8000/api/title/generate', {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (settings.apiKey) headers['X-Ark-Api-Key'] = settings.apiKey;
+    if (settings.model) headers['X-Ark-Model'] = settings.model;
+    const res = await fetch(`${settings.backendUrl}/api/title/generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ text, max_length: maxLength }),
     });
     if (!res.ok) return null;
@@ -354,6 +358,16 @@ export default function App() {
   const activeAbortControllerRef = useRef<AbortController | null>(null);
   // 全屏查看某条聊天消息的内容
   const [viewingMessage, setViewingMessage] = useState<ChatMessage | null>(null);
+  // 用户设置（API Key / 模型 / 后端地址）
+  const [settings, setSettings] = useState<UserSettings>(() => loadSettings());
+  const [showSettings, setShowSettings] = useState(false);
+  // 首次启动如果没填 API Key，自动弹设置面板
+  useEffect(() => {
+    if (!settings.apiKey) {
+      setShowSettings(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // 当前正在执行哪一步（基于 SSE stage_start 事件实时更新）
   const [currentRunningStepId, setCurrentRunningStepId] = useState<string | null>(null);
   const [currentRunningStepName, setCurrentRunningStepName] = useState<string>('');
@@ -408,9 +422,15 @@ export default function App() {
       params.set('reasoningEffort', payload.reasoningEffort);
     }
 
-    const postStream = () => fetch('http://localhost:8000/api/solve/stream', {
+    // 注入 API Key / 模型到请求头
+    const authHeaders: Record<string, string> = {};
+    if (settings.apiKey) authHeaders['X-Ark-Api-Key'] = settings.apiKey;
+    if (settings.model) authHeaders['X-Ark-Model'] = settings.model;
+    const baseUrl = settings.backendUrl || 'http://localhost:8000';
+
+    const postStream = () => fetch(`${baseUrl}/api/solve/stream`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify(payload),
       signal,
     });
@@ -419,10 +439,13 @@ export default function App() {
       return postStream();
     }
 
-    const getUrl = `http://localhost:8000/api/solve/stream?${params.toString()}`;
+    // GET 请求无法用自定义 header（EventSource 不支持），把 key 作为 query param 传
+    if (settings.apiKey) params.set('apiKey', settings.apiKey);
+    if (settings.model) params.set('model', settings.model);
+    const getUrl = `${baseUrl}/api/solve/stream?${params.toString()}`;
 
     try {
-      const getResponse = await fetch(getUrl, { signal });
+      const getResponse = await fetch(getUrl, { signal, headers: authHeaders });
       if (getResponse.status !== 414 && getResponse.status !== 431 && getResponse.status !== 405) {
         return getResponse;
       }
@@ -875,7 +898,7 @@ export default function App() {
       !existing?.titleLocked && // 用户改过名字就不再覆盖
       !existing?.aiTitleGenerated; // 已经生成过就不再调
     if (needsAITitle) {
-      generateAITitle(firstUserMsg).then(aiTitle => {
+      generateAITitle(firstUserMsg, settings).then(aiTitle => {
         if (!aiTitle) return;
         setConversations(prev => {
           const next = prev.map(c =>
@@ -1335,12 +1358,41 @@ export default function App() {
             </div>
             <h1 className="text-base font-bold text-slate-800">AI Agent 动态推理</h1>
           </div>
-          <button
-            onClick={startNewConversation}
-            className="px-3 py-1.5 text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
-          >
-            新对话
-          </button>
+          <div className="flex items-center gap-1.5">
+            {/* API Key 状态指示 */}
+            <button
+              onClick={() => setShowSettings(true)}
+              className={clsx(
+                'px-2.5 py-1 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors',
+                settings.apiKey
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                  : 'border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 animate-pulse'
+              )}
+              title={settings.apiKey ? `已配置 API Key · 模型 ${settings.model}` : '尚未填写 API Key，点击设置'}
+            >
+              <span className={clsx(
+                'w-1.5 h-1.5 rounded-full',
+                settings.apiKey ? 'bg-emerald-500' : 'bg-amber-500'
+              )} />
+              {settings.apiKey ? 'Key 已配置' : '请填 API Key'}
+            </button>
+            <button
+              onClick={() => setShowSettings(true)}
+              className="p-1.5 rounded-lg text-slate-500 hover:text-purple-600 hover:bg-purple-50 transition-colors"
+              title="设置"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </button>
+            <button
+              onClick={startNewConversation}
+              className="px-3 py-1.5 text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+            >
+              新对话
+            </button>
+          </div>
         </div>
       </header>
 
@@ -2001,6 +2053,17 @@ export default function App() {
           />
         </div>
       )}
+
+      {/* 设置面板 */}
+      <SettingsModal
+        open={showSettings}
+        initialSettings={settings}
+        onClose={() => setShowSettings(false)}
+        onSave={(newSettings) => {
+          setSettings(newSettings);
+          saveSettings(newSettings);
+        }}
+      />
     </div>
   );
 }

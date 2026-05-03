@@ -28,7 +28,7 @@
 
 **窗口 1：跑后端**
 ```powershell
-cd D:\Qingshen_Python\backend
+cd D:\AI_Python\backend
 python main.py
 ```
 
@@ -50,7 +50,7 @@ https://random-words-1234.trycloudflare.com
 
 **窗口 3：跑前端**
 ```powershell
-cd D:\Qingshen_Python\frontend
+cd D:\AI_Python\frontend
 npm run dev -- --host
 ```
 
@@ -88,12 +88,12 @@ C:\tools\cloudflared.exe tunnel --url http://localhost:5173
    - [Render](https://render.com) 用 GitHub 账号登录
 2. **把项目推到 GitHub**（如果还没推）：
    ```powershell
-   cd D:\Qingshen_Python
+   cd D:\AI_Python
    git init
    git add .
    git commit -m "init"
    # 在 GitHub 新建 repo 后：
-   git remote add origin https://github.com/你的用户名/Qingshen_Python.git
+   git remote add origin https://github.com/你的用户名/AI_Python.git
    git push -u origin main
    ```
    > ⚠️ 推之前先确认 `backend/main.py` 里的 `DEFAULT_DOUBAO_API_KEY` 已经清空（默认空的，不要把自己 Key 写进去），不然别人 fork 你代码就能盗用你的额度。
@@ -174,8 +174,8 @@ ALLOWED_ORIGINS=https://qingshen-python.vercel.app
 
 3. clone 项目：
    ```bash
-   git clone https://github.com/你的用户名/Qingshen_Python.git
-   cd Qingshen_Python
+   git clone https://github.com/你的用户名/AI_Python.git
+   cd AI_Python
    ```
 
 4. 跑后端（systemd 服务保活）：
@@ -193,8 +193,8 @@ ALLOWED_ORIGINS=https://qingshen-python.vercel.app
    After=network.target
    
    [Service]
-   WorkingDirectory=/root/Qingshen_Python/backend
-   ExecStart=/root/Qingshen_Python/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+   WorkingDirectory=/root/AI_Python/backend
+   ExecStart=/root/AI_Python/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
    Restart=always
    Environment=ALLOWED_ORIGINS=https://你的前端域名.com
    

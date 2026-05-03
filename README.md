@@ -1,4 +1,4 @@
-# AI Agent 动态推理可视化
+# AI_Python · AI Agent 动态推理可视化
 
 一个把"AI 一步步思考"的过程可视化出来的工具：你输入问题，AI 自动规划成多个推理步骤，你能看到每一步的输入输出、健康度、影响度，还能随时修改任意一步的 Prompt 让它重新算。
 
@@ -37,8 +37,8 @@
 ## 二、克隆项目
 
 ```powershell
-git clone https://github.com/你的用户名/Qingshen_Python.git
-cd Qingshen_Python
+git clone https://github.com/你的用户名/AI_Python.git
+cd AI_Python
 ```
 
 > 项目结构：
@@ -119,7 +119,7 @@ pnpm install
 ### 窗口 1：启动后端（必须先开）
 
 ```powershell
-cd D:\path\to\Qingshen_Python\backend
+cd D:\path\to\AI_Python\backend
 python main.py
 ```
 
@@ -128,7 +128,7 @@ python main.py
 ### 窗口 2：启动前端
 
 ```powershell
-cd D:\path\to\Qingshen_Python\frontend
+cd D:\path\to\AI_Python\frontend
 npm run dev
 ```
 
@@ -268,14 +268,14 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8001
 
 去 https://github.com/new
 
-- **Repository name**：`Qingshen_Python`（或别的名字）
+- **Repository name**：`AI_Python`（或别的名字）
 - **Public** / **Private**：随便
 - **不要勾**任何 "Initialize this repository with..."（README/.gitignore/license 全不勾）
 - 点 **Create repository**
 
 #### Step 2：本地推送
 
-在项目根目录 `D:\Qingshen_Python` 里：
+在项目根目录 `D:\AI_Python` 里：
 
 ```powershell
 # 初始化（如果还没初始化过）
@@ -296,7 +296,7 @@ git status
 git commit -m "init: AI Agent 动态推理项目"
 
 # 关联远程仓库（替换成你的 GitHub 用户名）
-git remote add origin https://github.com/你的用户名/Qingshen_Python.git
+git remote add origin https://github.com/你的用户名/AI_Python.git
 
 # 推送
 git push -u origin main
@@ -343,8 +343,8 @@ pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 npm config set registry https://registry.npmmirror.com
 
 # 3. 克隆项目
-git clone https://github.com/原作者/Qingshen_Python.git
-cd Qingshen_Python
+git clone https://github.com/原作者/AI_Python.git
+cd AI_Python
 
 # 4. 装依赖
 cd backend && pip install -r requirements.txt && cd ..

@@ -1,83 +1,90 @@
 @echo off
-chcp 65001 > nul
-setlocal
+title AI_Python Setup
 
-echo ================================================================
-echo   AI Agent 动态推理 - 一键安装依赖
-echo ================================================================
+echo ============================================================
+echo   AI_Python - Install Dependencies
+echo ============================================================
 echo.
 
-REM 检查 Python
+REM Step 1: Check Python
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [错误] 找不到 Python，请先安装 Python 3.9 或更高版本
-    echo        下载地址: https://www.python.org/downloads/
-    echo        安装时勾选 "Add Python to PATH"
+    echo [ERROR] Python not found.
+    echo         Please install Python 3.9+ from https://www.python.org/downloads/
+    echo         Make sure to check "Add Python to PATH" during install.
     pause
     exit /b 1
 )
-for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
-echo [OK] Python %PYVER%
+echo [OK] Python is installed
+python --version
 
-REM 检查 Node
+REM Step 2: Check Node.js
 where node >nul 2>nul
 if errorlevel 1 (
-    echo [错误] 找不到 Node.js，请先安装 Node 18 或更高版本
-    echo        下载地址: https://nodejs.org/
+    echo [ERROR] Node.js not found.
+    echo         Please install Node.js 18+ from https://nodejs.org/
     pause
     exit /b 1
 )
-for /f %%v in ('node --version') do set NODEVER=%%v
-echo [OK] Node.js %NODEVER%
+echo [OK] Node.js is installed
+node --version
 echo.
 
-REM 配置国内源
-echo [1/4] 配置 pip 清华源 ...
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple > nul 2>&1
-echo       完成
-
-echo [2/4] 配置 npm 淘宝源 ...
-call npm config set registry https://registry.npmmirror.com > nul 2>&1
-echo       完成
+REM Step 3: Configure mirrors (one-time)
+echo [Step 1/3] Configuring China mirrors...
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple >nul 2>nul
+call npm config set registry https://registry.npmmirror.com >nul 2>nul
+echo Done.
 echo.
 
-REM 装后端依赖
-echo [3/4] 安装后端依赖 (Python) ...
-cd /d "%~dp0backend"
+REM Step 4: Install backend deps
+echo [Step 2/3] Installing backend dependencies (Python)...
+echo This may take 1-3 minutes.
+echo.
+pushd "%~dp0backend"
 pip install -r requirements.txt
 if errorlevel 1 (
     echo.
-    echo [警告] 清华源失败，尝试阿里源 ...
+    echo [WARN] Tsinghua mirror failed, trying Aliyun mirror...
     pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     if errorlevel 1 (
-        echo [错误] 后端依赖安装失败
-        echo        请手动检查网络是否正常、是否需要关闭代理软件
+        echo.
+        echo [ERROR] Backend deps install failed.
+        echo         Check your internet connection or disable VPN/proxy.
+        popd
         pause
         exit /b 1
     )
 )
-echo       后端依赖安装完成
+popd
+echo Backend deps OK.
 echo.
 
-REM 装前端依赖
-echo [4/4] 安装前端依赖 (Node.js) ...
-echo       这一步可能需要 3-5 分钟，请耐心等待
-cd /d "%~dp0frontend"
+REM Step 5: Install frontend deps
+echo [Step 3/3] Installing frontend dependencies (Node.js)...
+echo This may take 3-10 minutes. Please be patient.
+echo.
+pushd "%~dp0frontend"
 call npm install --registry=https://registry.npmmirror.com
 if errorlevel 1 (
-    echo [错误] 前端依赖安装失败
+    echo.
+    echo [ERROR] Frontend deps install failed.
+    echo         Try: cd frontend ^&^& rmdir /s /q node_modules ^&^& npm install
+    popd
     pause
     exit /b 1
 )
-echo       前端依赖安装完成
+popd
+echo Frontend deps OK.
 echo.
 
-echo ================================================================
-echo   全部安装完成！
+echo ============================================================
+echo   ALL DONE!
 echo.
-echo   下一步：
-echo     1. 双击 start.bat 启动应用
-echo     2. 浏览器自动打开后，在设置里填入你的火山方舟 API Key
-echo ================================================================
+echo   Next step:
+echo     1. Double-click start.bat to launch the app
+echo     2. Browser will auto-open. Fill in your Doubao API Key
+echo        in the settings panel.
+echo ============================================================
 echo.
 pause

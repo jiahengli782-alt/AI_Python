@@ -15,9 +15,11 @@ export type AgentStageType =
 export type AgentFailureType =
   | 'none'
   | 'fact_error'
+  | 'unsupported_claim'
   | 'tool_misuse'
   | 'retrieval_miss'
   | 'planning_error'
+  | 'self_inconsistency'
   | 'constraint_violation'
   | 'format_error'
   | 'hallucination'
@@ -70,17 +72,25 @@ export interface DiagnosisStep {
   failure_type?: AgentFailureType;
   failure_label?: string;
   failure_confidence?: number;
+  failure_reason_summary?: string;
   failure_reason?: string;
+  likely_causes?: string[];
+  exclusion_checked?: string[];
+  related_stage?: string;
+  source_refs_used?: string[];
   diagnosis_status?: 'normal' | 'warning' | 'failure';
   observed_signals?: string[];
   evidence_source?: string;
   diagnosis_evidence?: string[];
   potential_risks?: {
     failure_type: AgentFailureType;
+    subtype?: string;
     label?: string;
     confidence?: number;
+    reason_summary?: string;
     reason?: string;
     source_excerpt?: string;
+    matched_signals?: string[];
     suggested_fix?: string;
     suggested_fixes?: string[];
     severity?: 'low' | 'medium' | 'high';
@@ -109,9 +119,11 @@ const stageLabels: Record<string, string> = {
 const failureLabels: Record<string, string> = {
   none: '未观察到失败',
   fact_error: '事实错误',
+  unsupported_claim: '无证据断言',
   tool_misuse: '工具/API失败',
   retrieval_miss: '证据缺失',
   planning_error: '规划不完整',
+  self_inconsistency: '步骤间自相矛盾',
   constraint_violation: '验证未通过',
   format_error: '格式不符',
   hallucination: '缺少证据支撑',
@@ -168,6 +180,8 @@ const cleanFixText = (fix: string) =>
 
 const shortWhy = (reason = '', label = '可能有问题') => {
   const clean = reason.replace(/\s+/g, ' ').trim();
+  const afterColon = clean.match(/(?:为什么可能错|完整原因|原因|因此|所以)[：:]\s*(.+)$/);
+  if (afterColon?.[1]) return compactLine(afterColon[1], 42);
   const missing = clean.match(/(?:没有看到|缺少|缺失)[“"]([^”"]+)[”"]/);
   if (missing?.[1]) return `缺少${missing[1]}`;
   const outputIssue = clean.match(/当前输出[“"][^”"]+[”"]里没有看到[“"]([^”"]+)[”"]/);
@@ -176,6 +190,34 @@ const shortWhy = (reason = '', label = '可能有问题') => {
   if (direction?.[0]) return direction[0];
   return compactLine(clean || label, 42);
 };
+
+type PotentialRisk = NonNullable<DiagnosisStep['potential_risks']>[number];
+
+const shortPotentialWhy = (risk: PotentialRisk) =>
+  compactLine(risk.reason_summary || shortWhy(risk.reason || '', risk.label || risk.failure_type), 54);
+
+const shortStepWhy = (step: DiagnosisStep) =>
+  compactLine(step.failure_reason_summary || shortWhy(step.failure_reason || '', labelOf(step)), 58);
+
+const buildRiskDetail = (risk: PotentialRisk) => [
+  `错误类型：${risk.label || risk.failure_type}`,
+  risk.subtype ? `细分类：${risk.subtype}` : '',
+  `置信度：${normalizePercent(risk.confidence)}%`,
+  '',
+  `短原因：${shortPotentialWhy(risk)}`,
+  '',
+  `完整错误内容与信息：`,
+  risk.reason || '无完整原因',
+  '',
+  `触发这条判断的原文：`,
+  risk.source_excerpt || '无',
+  '',
+  `匹配到的问题/日志信号：`,
+  ...(risk.matched_signals?.length ? risk.matched_signals : ['暂无']),
+  '',
+  `修复建议：`,
+  ...(risk.suggested_fixes?.length ? risk.suggested_fixes : risk.suggested_fix ? [risk.suggested_fix] : ['暂无']),
+].filter(Boolean).join('\n');
 
 const mergeFixItems = (items: string[]) => {
   const groups = new Map<string, string[]>();
@@ -449,24 +491,20 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis }: AgentDiagnosisPan
                   {(step.potential_risks || []).map((risk, idx) => (
                     <div key={idx} className="rounded-md bg-sky-50 p-2 text-xs leading-5 text-slate-700">
                       <div className="font-semibold text-sky-800">{risk.label || risk.failure_type} · 置信 {normalizePercent(risk.confidence)}%</div>
-                      {risk.reason && (
-                        <div className="mt-1">
-                          为什么可能错：{shortWhy(risk.reason, risk.label || risk.failure_type)}
-                          {risk.reason.length > 42 && (
-                            <button
-                              type="button"
-                              onClick={() => setDetailModal({
-                                title: `Step ${step.order}: ${risk.label || risk.failure_type}`,
-                                content: `完整原因：\n${risk.reason}\n\n触发这条判断的原文：\n${risk.source_excerpt || '无'}`
-                              })}
-                              className="ml-2 rounded px-1.5 py-0.5 text-[11px] font-medium text-sky-700 hover:bg-white"
-                            >
-                              查看完整
-                            </button>
-                          )}
-                        </div>
-                      )}
-                      {risk.source_excerpt && <div>触发文本：{compactLine(risk.source_excerpt, 86)}</div>}
+                      <div className="mt-1">
+                        为什么可能错：{shortPotentialWhy(risk)}
+                        <button
+                          type="button"
+                          onClick={() => setDetailModal({
+                            title: `Step ${step.order}: ${risk.label || risk.failure_type}`,
+                            content: buildRiskDetail(risk)
+                          })}
+                          className="ml-2 rounded px-1.5 py-0.5 text-[11px] font-medium text-sky-700 hover:bg-white"
+                        >
+                          查看全部
+                        </button>
+                      </div>
+                      {risk.source_excerpt && <div>触发文本：{compactLine(risk.source_excerpt, 72)}</div>}
                     </div>
                   ))}
                 </div>
@@ -481,17 +519,34 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis }: AgentDiagnosisPan
                   <div className="text-xs text-slate-500">证据强度 {normalizePercent(step.failure_confidence)}%</div>
                 </div>
                 <p className="mt-2 text-xs leading-5 text-slate-600">
-                  {shortWhy(step.failure_reason || '', labelOf(step))}
+                  {shortStepWhy(step)}
                   {step.failure_reason && step.failure_reason.length > 42 && (
                     <button
                       type="button"
                       onClick={() => setDetailModal({
                         title: `Step ${step.order}: ${labelOf(step)}`,
-                        content: `完整原因：\n${step.failure_reason}\n\n触发这条判断的原文：\n${(step.diagnosis_evidence || []).join('\n') || '无'}`
+                        content: [
+                          `错误类型：${labelOf(step)}`,
+                          `置信度：${normalizePercent(step.failure_confidence)}%`,
+                          '',
+                          `短原因：${shortStepWhy(step)}`,
+                          '',
+                          `完整错误内容与信息：`,
+                          step.failure_reason || '无',
+                          '',
+                          `触发这条判断的原文：`,
+                          (step.diagnosis_evidence || []).join('\n') || '无',
+                          '',
+                          `可能原因：`,
+                          ...(step.likely_causes?.length ? step.likely_causes : ['暂无']),
+                          '',
+                          `已排除/区分：`,
+                          ...(step.exclusion_checked?.length ? step.exclusion_checked : ['暂无']),
+                        ].join('\n')
                       })}
                       className="ml-2 rounded px-1.5 py-0.5 text-[11px] font-medium text-red-700 hover:bg-red-50"
                     >
-                      查看完整
+                      查看全部
                     </button>
                   )}
                 </p>

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
+import type { AgentFailureType, AgentTraceDiagnosis, PropagationEdge } from './AgentDiagnosisPanel';
 
 interface Subprocess {
   id: string;
@@ -14,6 +15,29 @@ interface Subprocess {
   systemPrompt?: string;
   userPrompt?: string;
   userPromptTemplate?: string;
+  failure_type?: AgentFailureType;
+  failure_label?: string;
+  failure_confidence?: number;
+  failure_reason?: string;
+  diagnosis_status?: 'normal' | 'warning' | 'failure';
+  diagnosis_evidence?: string[];
+  observed_signals?: string[];
+  evidence_source?: string;
+  potential_risks?: {
+    failure_type: AgentFailureType;
+    label?: string;
+    confidence?: number;
+    reason?: string;
+    source_excerpt?: string;
+    suggested_fix?: string;
+    suggested_fixes?: string[];
+    severity?: 'low' | 'medium' | 'high';
+  }[];
+  potential_issue_tags?: string[];
+  source_refs?: string[];
+  where_to_steps?: number[];
+  affected_steps?: number[];
+  propagation_edges?: PropagationEdge[];
 }
 
 export interface TreePreviewResult {
@@ -49,6 +73,7 @@ interface PromptTreePanelProps {
   promptDrafts: Record<string, string>;
   previewResults: TreePreviewResult[];
   previewFinalOutput: string;
+  traceDiagnosis?: AgentTraceDiagnosis | null;
   canUndoTreeChange: boolean;
   isPreviewing: boolean;
   resetSignal: number;
@@ -76,17 +101,6 @@ function compactResult(text: string, maxLength = 24) {
   return meaningful.length > maxLength ? meaningful.slice(0, maxLength) : meaningful;
 }
 
-// 仅用于树节点小卡片的"显示"：必须截断，否则 UI 撑爆
-function extractTreePromptForDisplay(text: string) {
-  if (!text) return '';
-  const markerIndex = text.indexOf(marker);
-  if (markerIndex >= 0) {
-    const afterMarker = text.slice(markerIndex + marker.length).trim();
-    return afterMarker.split(/\n\s*\n/)[0].trim();
-  }
-  return compactText(text, 92);
-}
-
 // 用于编辑框的"取值"：返回完整内容，不截断（编辑时用户需要看到完整 prompt）
 function extractTreePromptForEdit(text: string) {
   if (!text) return '';
@@ -98,9 +112,6 @@ function extractTreePromptForEdit(text: string) {
   }
   return text.trim();
 }
-
-// 兼容旧调用名称
-const extractTreePrompt = extractTreePromptForDisplay;
 
 function buildStepSuggestions(step: Subprocess, index: number): TreeSuggestion[] {
   const base = step.name || `步骤${index + 1}`;
@@ -133,6 +144,7 @@ export function PromptTreePanel({
   promptDrafts,
   previewResults,
   previewFinalOutput,
+  traceDiagnosis,
   canUndoTreeChange,
   isPreviewing,
   resetSignal,
@@ -156,6 +168,27 @@ export function PromptTreePanel({
   }, [subprocesses]);
 
   const selectedStep = subprocesses.find(step => step.id === selectedStepId);
+  const isEvidenceFailure = (step: Subprocess) => step.diagnosis_status === 'failure';
+  const evidenceFailures = subprocesses.filter(isEvidenceFailure);
+  const affectedStepOrders = new Set<number>(
+    evidenceFailures.flatMap(step => step.affected_steps || [])
+  );
+  const propagationEdges = [
+    ...(traceDiagnosis?.propagation_edges || []),
+    ...evidenceFailures.flatMap(step => step.propagation_edges || []),
+  ].filter((edge, index, arr) =>
+    edge.from_step > 0 &&
+    edge.to_step > 0 &&
+    edge.to_step <= subprocesses.length &&
+    arr.findIndex(item => item.from_step === edge.from_step && item.to_step === edge.to_step) === index
+  );
+  const dataflowEdges = subprocesses.flatMap(step =>
+    (step.where_to_steps || [])
+      .filter(target => target > step.order && target <= subprocesses.length)
+      .map(target => ({ from_step: step.order, to_step: target }))
+  ).filter((edge, index, arr) =>
+    arr.findIndex(item => item.from_step === edge.from_step && item.to_step === edge.to_step) === index
+  );
   const firstStep = subprocesses[0];
   const goalSuggestions: TreeSuggestion[] = useMemo(() => firstStep ? [
       {
@@ -193,6 +226,45 @@ export function PromptTreePanel({
   const getStepFullResult = (step: Subprocess) =>
     step.output || step.description || step.input || '该步骤还没有完整结果';
 
+  const getStepDetailContent = (step: Subprocess) => {
+    const blocks: string[] = [];
+    const whereToText = step.where_to_steps?.length
+      ? `Step ${step.where_to_steps.join(', Step ')}`
+      : '没有直接下游步骤';
+    blocks.push(`【真实到哪里去】${whereToText}`);
+    if (step.potential_risks?.length) {
+      blocks.push(`【可能出现的推理风险】\n${step.potential_risks.map((risk, idx) => {
+        const confidence = Math.round((risk.confidence || 0) * 100);
+        return `${idx + 1}. ${risk.label || risk.failure_type}（${confidence}%）\n原因：${risk.reason || '基于问题/文档/日志特征推断'}\n来源：${risk.source_excerpt || '当前问题上下文'}`;
+      }).join('\n\n')}`);
+    }
+    if (step.diagnosis_status === 'failure') {
+      blocks.push(`【可能错误类型】${step.failure_label || step.failure_type || '未知错误'}`);
+      if (step.evidence_source) {
+        blocks.push(`【可能出错的文字源头】\n${step.evidence_source}`);
+      }
+      if (step.failure_reason) {
+        blocks.push(`【为什么可能错】\n${step.failure_reason}`);
+      }
+      if (step.affected_steps?.length) {
+        blocks.push(`【真实影响到】Step ${step.affected_steps.join(', Step ')}`);
+      }
+      if (step.diagnosis_evidence?.length) {
+        blocks.push(`【真实证据】\n${step.diagnosis_evidence.join('\n')}`);
+      }
+      blocks.push(`【完整输出】\n${getStepFullResult(step)}`);
+      return blocks.join('\n\n');
+    }
+    if (step.diagnosis_status === 'warning') {
+      blocks.push(`【性能/上下文提示】${step.failure_label || step.failure_type || '成本/延迟/上下文提示'}`);
+      if (step.evidence_source) blocks.push(`【提示来源】\n${step.evidence_source}`);
+      blocks.push(`【完整输出】\n${getStepFullResult(step)}`);
+      return blocks.join('\n\n');
+    }
+    blocks.push(`【完整输出】\n${getStepFullResult(step)}`);
+    return blocks.join('\n\n');
+  };
+
   const openCurrentStep = (step: Subprocess, preview?: TreePreviewResult) => {
     onSelectStep(step.id);
     setEditingTarget({ type: 'current', stepId: step.id });
@@ -201,7 +273,7 @@ export function PromptTreePanel({
     if (preview?.fullResult) {
       setResultDetail({ title: `${preview.name} 的完整试运行结果`, content: preview.fullResult });
     } else {
-      setResultDetail({ title: `${step.name} 的完整结果`, content: getStepFullResult(step) });
+      setResultDetail({ title: `${step.name} 的完整结果`, content: getStepDetailContent(step) });
     }
   };
 
@@ -268,7 +340,7 @@ export function PromptTreePanel({
       if (preview?.fullResult) {
         setResultDetail({ title: `${preview.name} 的完整试运行结果`, content: preview.fullResult });
       } else {
-        setResultDetail({ title: `${step.name} 的完整结果`, content: getStepFullResult(step) });
+        setResultDetail({ title: `${step.name} 的完整结果`, content: getStepDetailContent(step) });
       }
       return;
     }
@@ -313,12 +385,12 @@ export function PromptTreePanel({
       disabled={!suggestion}
       className={clsx(
         'min-h-[74px] rounded-lg border bg-white/95 px-3 py-2 text-left shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md disabled:opacity-40',
-        isActiveSuggestion ? 'border-red-300 bg-red-50 shadow-red-100' : 'border-slate-300 hover:border-slate-400'
+        isActiveSuggestion ? 'border-sky-300 bg-sky-50 shadow-sky-100' : 'border-slate-300 hover:border-slate-400'
       )}
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-semibold text-slate-600">{suggestion?.title || '其他方向'}</span>
-        <span className={clsx('w-2 h-2 rounded-full', isActiveSuggestion ? 'bg-red-400' : 'bg-slate-300')} />
+        <span className={clsx('w-2 h-2 rounded-full', isActiveSuggestion ? 'bg-sky-400' : 'bg-slate-300')} />
       </div>
       <p
         className="mt-2 overflow-hidden text-[11px] text-slate-500 leading-relaxed"
@@ -346,7 +418,9 @@ export function PromptTreePanel({
               </span>
             )}
           </h3>
-          <p className="text-[11px] text-slate-400 mt-0.5">红色为当前结果，灰色为AI建议方向</p>
+          <p className="text-[11px] text-slate-400 mt-0.5">
+            红色错误源来自真实日志/输出证据，橙色表示被传播影响；灰色为AI建议方向
+          </p>
         </div>
         <div className="flex items-center gap-1.5">
           <div className="flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5">
@@ -397,18 +471,18 @@ export function PromptTreePanel({
               <svg className="pointer-events-none absolute inset-x-0 top-0 h-full w-full overflow-visible" aria-hidden="true">
                 <path d="M380 94 C300 122 260 122 180 128" stroke="#b6b6b6" strokeWidth="3" fill="none" strokeLinecap="round" />
                 <path d="M380 94 C460 122 500 122 580 128" stroke="#b6b6b6" strokeWidth="3" fill="none" strokeLinecap="round" />
-                <path d="M380 94 L380 146" stroke="#ff6b6b" strokeWidth="3" fill="none" strokeLinecap="round" />
+                <path d="M380 94 L380 146" stroke="#cbd5e1" strokeWidth="3" fill="none" strokeLinecap="round" />
               </svg>
 
               <div className="relative z-10 grid grid-cols-[1fr_1.18fr_1fr] gap-4 items-center">
                 <BranchButton suggestion={goalSuggestions[0]} />
                 <button
-                  className="min-h-[96px] text-left rounded-xl border-2 border-red-300 bg-white px-4 py-3 shadow-sm transition-all hover:border-red-400 hover:shadow-md"
+                  className="min-h-[96px] text-left rounded-xl border-2 border-slate-300 bg-white px-4 py-3 shadow-sm transition-all hover:border-sky-400 hover:shadow-md"
                   title={goal}
                 >
                   <div className="flex items-center justify-between">
                     <span className="text-sm font-semibold tracking-wide text-slate-800">GOAL</span>
-                    <span className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-sm shadow-red-300" />
+                    <span className="w-2.5 h-2.5 rounded-full bg-sky-500 shadow-sm shadow-sky-200" />
                   </div>
                   <p className="mt-2 text-xs text-slate-600 leading-relaxed">{compactText(goal, 86)}</p>
                 </button>
@@ -416,9 +490,45 @@ export function PromptTreePanel({
               </div>
             </div>
 
-            <div className="mx-auto h-10 w-px bg-red-300" />
+            <div className="mx-auto h-10 w-px bg-slate-300" />
 
-            <div className="space-y-5">
+            <div className="relative space-y-5">
+              {(dataflowEdges.length > 0 || propagationEdges.length > 0) && (
+                <svg
+                  className="pointer-events-none absolute left-0 top-0 z-0 h-full w-full overflow-visible"
+                  aria-hidden="true"
+                >
+                  {dataflowEdges.map((edge) => {
+                    const y1 = (edge.from_step - 1) * 145 + 44;
+                    const y2 = (edge.to_step - 1) * 145 + 44;
+                    return (
+                      <path
+                        key={`flow-${edge.from_step}-${edge.to_step}`}
+                        d={`M 305 ${y1} C 160 ${y1}, 160 ${y2}, 305 ${y2}`}
+                        stroke="#cbd5e1"
+                        strokeWidth="2"
+                        fill="none"
+                        strokeLinecap="round"
+                      />
+                    );
+                  })}
+                  {propagationEdges.map((edge) => {
+                    const y1 = (edge.from_step - 1) * 145 + 44;
+                    const y2 = (edge.to_step - 1) * 145 + 44;
+                    return (
+                      <path
+                        key={`error-${edge.from_step}-${edge.to_step}`}
+                        d={`M 455 ${y1} C 650 ${y1}, 650 ${y2}, 455 ${y2}`}
+                        stroke="#ef4444"
+                        strokeWidth="2.5"
+                        strokeDasharray="5 4"
+                        fill="none"
+                        strokeLinecap="round"
+                      />
+                    );
+                  })}
+                </svg>
+              )}
               {subprocesses.map((step, index) => {
                 const suggestions = suggestionsByStep[step.id] || [];
                 const isSelected = selectedStepId === step.id;
@@ -431,10 +541,28 @@ export function PromptTreePanel({
                   preview && preview.status !== 'unchanged' ? preview.summary : getStepResultSummary(step),
                   22
                 );
-                const alteredPath = isPreviewChanged || isPreviewAffected;
+                const stepFailed = Boolean(isEvidenceFailure(step));
+                const stepAffected = affectedStepOrders.has(step.order);
+                const stepPotential = !stepFailed && !stepAffected && Boolean(step.potential_risks?.length);
+                const outgoingToNext = propagationEdges.some(edge => edge.from_step === step.order && edge.to_step === step.order + 1);
+                const alteredPath = isPreviewChanged || isPreviewAffected || outgoingToNext;
+                const sourceText = (step.source_refs || []).slice(0, 2).join(', ') || 'user_query';
+                const whereToText = (step.where_to_steps || []).length
+                  ? `到 Step ${(step.where_to_steps || []).join(', Step ')}`
+                  : '没有直接下游';
+                const affectedText = (step.affected_steps || []).length
+                  ? `影响 Step ${(step.affected_steps || []).join(', Step ')}`
+                  : '';
+                const diagnosticSummary = stepFailed
+                  ? `${step.failure_label || '内容错误源'} · ${(step.evidence_source || `from ${sourceText}`).slice(0, 28)} · ${affectedText || whereToText}`
+                  : stepAffected
+                    ? `受上游错误影响 · ${whereToText}`
+                    : stepPotential
+                      ? `可能风险：${(step.potential_issue_tags || []).slice(0, 2).join('、') || step.potential_risks?.[0]?.label} · ${whereToText}`
+                      : `${whereToText} · 来源 ${sourceText}`;
 
                 return (
-                  <div key={step.id} className="relative mx-auto w-[760px]">
+                  <div key={step.id} className="relative z-10 mx-auto w-[760px]">
                     <svg className="pointer-events-none absolute inset-x-0 top-0 h-[116px] w-full overflow-visible" aria-hidden="true">
                       <path d="M380 48 C306 80 260 80 180 74" stroke={alteredPath ? '#f59e0b' : '#b6b6b6'} strokeWidth="3" fill="none" strokeLinecap="round" />
                       <path d="M380 48 C454 80 500 80 580 74" stroke={alteredPath ? '#f59e0b' : '#b6b6b6'} strokeWidth="3" fill="none" strokeLinecap="round" />
@@ -448,10 +576,13 @@ export function PromptTreePanel({
                           onClick={() => openCurrentStep(step, preview)}
                           className={clsx(
                             'w-full min-h-[88px] rounded-xl border-2 bg-white px-3 py-2 text-left transition-all hover:-translate-y-0.5',
-                            isPreviewChanged ? 'border-red-500 bg-red-50 shadow-lg shadow-red-100' :
-                              isPreviewAffected ? 'border-amber-400 bg-amber-50 shadow-md shadow-amber-100' :
-                                isSelected ? 'border-red-500 shadow-lg shadow-red-100' :
-                                  'border-red-300 shadow-sm hover:border-red-400 hover:shadow-md'
+                              stepFailed ? 'border-red-500 bg-red-50 shadow-lg shadow-red-100' :
+                                stepAffected ? 'border-amber-400 bg-amber-50 shadow-md shadow-amber-100' :
+                                  stepPotential ? 'border-sky-300 bg-sky-50/80 shadow-md shadow-sky-100' :
+                                isPreviewChanged ? 'border-sky-500 bg-sky-50 shadow-lg shadow-sky-100' :
+                                  isPreviewAffected ? 'border-amber-400 bg-amber-50 shadow-md shadow-amber-100' :
+                                isSelected ? 'border-sky-500 shadow-lg shadow-sky-100' :
+                                  'border-slate-300 shadow-sm hover:border-sky-400 hover:shadow-md'
                           )}
                         >
                           <div className="flex min-w-0 items-center justify-between gap-2">
@@ -459,36 +590,60 @@ export function PromptTreePanel({
                               STEP {index + 1}: {displayName}
                             </span>
                             <div className="flex shrink-0 items-center gap-1.5">
+                              {stepFailed && (
+                                <span className="rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700">
+                                  错误源
+                                </span>
+                              )}
+                              {!stepFailed && stepAffected && (
+                                <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                                  受影响
+                                </span>
+                              )}
+                              {stepPotential && (
+                                <span className="rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-medium text-sky-700">
+                                  可能风险
+                                </span>
+                              )}
                               {preview && preview.status !== 'unchanged' && (
                                 <span className={clsx(
                                   'rounded-full px-1.5 py-0.5 text-[10px] font-medium',
-                                  isPreviewChanged ? 'bg-red-100 text-red-600' : 'bg-amber-100 text-amber-700'
+                                  isPreviewChanged ? 'bg-sky-100 text-sky-700' : 'bg-amber-100 text-amber-700'
                                 )}>
                                   {isPreviewChanged ? '试运行改动' : '试运行后续'}
                                 </span>
                               )}
                               <span className={clsx(
                                 'w-2.5 h-2.5 rounded-full',
-                                isPreviewAffected ? 'bg-amber-500' : 'bg-red-500'
+                                stepFailed ? 'bg-red-500' : isPreviewAffected || stepAffected ? 'bg-amber-500' : stepPotential ? 'bg-sky-500' : 'bg-sky-500'
                               )} />
                             </div>
                           </div>
                           <p className={clsx(
                             'mt-2 text-[11px] leading-relaxed overflow-hidden',
-                            isPreviewAffected ? 'text-amber-800' : isPreviewChanged ? 'text-red-700' : 'text-slate-600'
+                            stepFailed ? 'text-red-700' : stepAffected ? 'text-amber-800' : stepPotential ? 'text-sky-800' : isPreviewAffected ? 'text-amber-800' : isPreviewChanged ? 'text-sky-700' : 'text-slate-600'
                           )}
                             style={{ display: '-webkit-box', WebkitLineClamp: 1, WebkitBoxOrient: 'vertical' }}
                             title={preview?.fullResult || getStepFullResult(step)}
                           >
                             {displayText}
                           </p>
+                          <div
+                            className={clsx(
+                              'mt-1 truncate text-[10px]',
+                              stepFailed ? 'text-red-500' : stepAffected ? 'text-amber-600' : stepPotential ? 'text-sky-600' : 'text-slate-400'
+                            )}
+                            title={step.failure_reason || diagnosticSummary}
+                          >
+                            {diagnosticSummary}
+                          </div>
                         </button>
                       </div>
 
                       <BranchButton suggestion={suggestions[1]} />
                     </div>
                     {index < subprocesses.length - 1 && (
-                      <div className={clsx('mx-auto h-9 w-px', alteredPath ? 'bg-amber-400' : 'bg-red-300')} />
+                      <div className={clsx('mx-auto h-9 w-px', outgoingToNext ? 'bg-red-400' : alteredPath ? 'bg-amber-400' : 'bg-slate-300')} />
                     )}
                   </div>
                 );

@@ -8,9 +8,11 @@ export interface ConversationSnapshot {
   timestamp: number;
   chatMessages: any[];
   subprocesses: any[];
+  traceDiagnosis?: any;
   modificationHistory: any[];
   treePromptDrafts: Record<string, string>;
   activeQuestion: string;
+  uploadedDocuments?: any[];
   /** 用户是否手动改过标题（改过就不让 AI 覆盖） */
   titleLocked?: boolean;
   /** AI 是否已经生成过标题（避免重复调用） */

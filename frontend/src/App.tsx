@@ -4,6 +4,7 @@ import { ModificationFlow } from './components/ModificationFlow';
 import { PromptTreePanel, type TreePreviewResult } from './components/PromptTreePanel';
 import { ChatHistoryPanel, type ConversationSnapshot } from './components/ChatHistoryPanel';
 import { SettingsModal, loadSettings, saveSettings, type UserSettings } from './components/SettingsModal';
+import { AgentDiagnosisPanel, type AgentTraceDiagnosis, type AgentStageType, type AgentFailureType } from './components/AgentDiagnosisPanel';
 
 const CONVERSATIONS_STORAGE_KEY = 'agent_conversations_v1';
 const ACTIVE_CONVERSATION_STORAGE_KEY = 'agent_active_conversation_v1';
@@ -208,6 +209,44 @@ interface Subprocess {
     outputQuality?: number;
     riskScore?: number;
   };
+  stage?: AgentStageType;
+  stage_label?: string;
+  health_score?: number;
+  risk_score?: number;
+  impact_score?: number;
+  latency_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  source_refs?: string[];
+  where_to_steps?: number[];
+  affected_steps?: number[];
+  propagation_edges?: {
+    from_step: number;
+    to_step: number;
+    failure_type?: AgentFailureType;
+    reason?: string;
+    source_excerpt?: string;
+  }[];
+  failure_type?: AgentFailureType;
+  failure_label?: string;
+  failure_confidence?: number;
+  failure_reason?: string;
+  diagnosis_status?: 'normal' | 'warning' | 'failure';
+  observed_signals?: string[];
+  evidence_source?: string;
+  diagnosis_evidence?: string[];
+  potential_risks?: {
+    failure_type: AgentFailureType;
+    label?: string;
+    confidence?: number;
+    reason?: string;
+    source_excerpt?: string;
+    suggested_fix?: string;
+    suggested_fixes?: string[];
+    severity?: 'low' | 'medium' | 'high';
+  }[];
+  potential_issue_tags?: string[];
+  suggested_fix?: string[];
   order: number;
   systemPrompt?: string;
   userPrompt?: string;
@@ -224,6 +263,15 @@ interface ChatMessage {
   /** 全部推理步骤的输出拼接（最完整的内容，用于查看 AI 全部产出） */
   allStagesContent?: string;
   timestamp: Date;
+}
+
+interface UploadedDocument {
+  id: string;
+  filename: string;
+  size: number;
+  charCount: number;
+  chunkCount: number;
+  preview?: string;
 }
 
 interface TreeEditSnapshot {
@@ -284,6 +332,41 @@ function formatJsonToChinese(text: string): string {
   }
 }
 
+function HighlightedEvidenceText({
+  text,
+  evidence,
+  active,
+}: {
+  text: string;
+  evidence?: string;
+  active?: boolean;
+}) {
+  if (!active || !evidence?.trim() || !text) return <>{text}</>;
+  const cleanEvidence = evidence.replace(/\s+/g, ' ').trim();
+  const candidates = [
+    evidence.trim(),
+    cleanEvidence,
+    cleanEvidence.slice(0, 160),
+    cleanEvidence.slice(0, 80),
+  ].filter(item => item.length >= 12);
+
+  for (const candidate of candidates) {
+    const index = text.indexOf(candidate);
+    if (index >= 0) {
+      return (
+        <>
+          {text.slice(0, index)}
+          <mark className="rounded bg-red-100 px-0.5 text-red-800 ring-1 ring-red-200">
+            {text.slice(index, index + candidate.length)}
+          </mark>
+          {text.slice(index + candidate.length)}
+        </>
+      );
+    }
+  }
+  return <>{text}</>;
+}
+
 function translateKey(key: string): string {
   const keyMap: Record<string, string> = {
     'result': '结果', 'output': '输出', 'answer': '答案', 'content': '内容',
@@ -334,10 +417,15 @@ export default function App() {
   const [isTreePreviewing, setIsTreePreviewing] = useState(false);
   const [treeResetSignal, setTreeResetSignal] = useState(0);
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
+  const [traceDiagnosis, setTraceDiagnosis] = useState<AgentTraceDiagnosis | null>(null);
+  const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([]);
+  const [isUploadingDocument, setIsUploadingDocument] = useState(false);
+  const [isDraggingDocument, setIsDraggingDocument] = useState(false);
   const [modificationHistory, setModificationHistory] = useState<{
     round: number;
     modifiedStepIndex: number;
     stages: Subprocess[];
+    traceDiagnosis?: AgentTraceDiagnosis | null;
     timestamp: number;
   }[]>([]);
   const [reasoningEffort, setReasoningEffort] = useState<'minimal' | 'low' | 'medium' | 'high'>('medium');
@@ -352,6 +440,7 @@ export default function App() {
   });
 
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const stepCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const treeEditSnapshotRef = useRef<TreeEditSnapshot | null>(null);
   // 当前流式请求的 AbortController，切换/新建对话时用来中断
@@ -381,6 +470,52 @@ export default function App() {
     }
   };
 
+  const documentIdsForRun = () => uploadedDocuments.map(doc => doc.id);
+
+  const uploadDocumentFiles = async (files: FileList | File[]) => {
+    const items = Array.from(files).filter(file => file.size > 0);
+    if (!items.length || isUploadingDocument) return;
+
+    setIsUploadingDocument(true);
+    setError(null);
+    const baseUrl = settings.backendUrl || 'http://localhost:8000';
+
+    try {
+      const uploaded: UploadedDocument[] = [];
+      for (const file of items) {
+        const response = await fetch(`${baseUrl}/api/documents/upload`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': file.type || 'application/octet-stream',
+            'X-File-Name': encodeURIComponent(file.name),
+            'X-File-Type': file.type || 'application/octet-stream',
+          },
+          body: file,
+        });
+        if (!response.ok) {
+          let message = `上传失败: ${response.status}`;
+          try {
+            const data = await response.json();
+            message = data.detail || message;
+          } catch {}
+          throw new Error(`${file.name}: ${message}`);
+        }
+        uploaded.push(await response.json());
+      }
+      setUploadedDocuments(prev => {
+        const byId = new Map(prev.map(doc => [doc.id, doc]));
+        uploaded.forEach(doc => byId.set(doc.id, doc));
+        return Array.from(byId.values());
+      });
+    } catch (err: any) {
+      setError(err.message || '文档上传失败');
+    } finally {
+      setIsUploadingDocument(false);
+      setIsDraggingDocument(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
   const streamSolve = async (payload: {
     question: string;
     startStepIndex?: number;
@@ -389,6 +524,7 @@ export default function App() {
     baseStages?: Subprocess[];
     previewMode?: boolean;
     reasoningEffort?: string;
+    documentIds?: string[];
   }) => {
     // 创建新 AbortController 并替换之前的（旧的会被 abort）
     abortActiveStream();
@@ -420,6 +556,10 @@ export default function App() {
 
     if (payload.reasoningEffort) {
       params.set('reasoningEffort', payload.reasoningEffort);
+    }
+
+    if (payload.documentIds?.length) {
+      params.set('documentIds', JSON.stringify(payload.documentIds));
     }
 
     // 注入 API Key / 模型到请求头
@@ -486,12 +626,6 @@ export default function App() {
       '',
       cleanedBase || '问题：{question}\n\n已知：\n{previous_output}\n\n请根据摘要Prompt生成该子过程的结构化结果。',
     ].join('\n');
-  };
-
-  const summarizeForPreview = (text: string, maxLength = 80) => {
-    const clean = (text || '').replace(/\s+/g, ' ').trim();
-    if (!clean) return '暂无可预览结果';
-    return clean.length > maxLength ? `${clean.slice(0, maxLength)}...` : clean;
   };
 
   const formatApiErrorMessage = (message = '') => {
@@ -663,6 +797,7 @@ export default function App() {
         },
         baseStages: buildPreviewBaseStages(subprocesses),
         previewMode: true,
+        documentIds: documentIdsForRun(),
       });
 
       if (!response.ok) throw new Error(`试运行失败: ${response.status}`);
@@ -867,9 +1002,11 @@ export default function App() {
       timestamp: Date.now(),
       chatMessages: chatMessages.map(m => ({ ...m, timestamp: m.timestamp })),
       subprocesses: subprocesses.map(s => ({ ...s })),
+      traceDiagnosis,
       modificationHistory: modificationHistory.map(h => ({ ...h, stages: h.stages.map(s => ({ ...s })) })),
       treePromptDrafts: { ...treePromptDrafts },
       activeQuestion,
+      uploadedDocuments: uploadedDocuments.map(doc => ({ ...doc })),
     };
   };
 
@@ -932,7 +1069,7 @@ export default function App() {
     const t = setTimeout(() => saveCurrentToHistory(), 600);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatMessages, subprocesses, modificationHistory, treePromptDrafts]);
+  }, [chatMessages, subprocesses, traceDiagnosis, modificationHistory, treePromptDrafts, uploadedDocuments]);
 
   // 加载某条历史对话
   const loadConversation = (id: string) => {
@@ -949,8 +1086,10 @@ export default function App() {
     try { localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, id); } catch {}
     setChatMessages(conv.chatMessages || []);
     setSubprocesses(conv.subprocesses || []);
+    setTraceDiagnosis(conv.traceDiagnosis || null);
     setModificationHistory(conv.modificationHistory || []);
     setTreePromptDrafts(conv.treePromptDrafts || {});
+    setUploadedDocuments(conv.uploadedDocuments || []);
     setActiveQuestion(conv.activeQuestion || conv.question || '');
     // 清理编辑/试运行临时状态
     setEditingStepId(null);
@@ -978,8 +1117,10 @@ export default function App() {
       // 清空当前界面
       setChatMessages([]);
       setSubprocesses([]);
+      setTraceDiagnosis(null);
       setModificationHistory([]);
       setTreePromptDrafts({});
+      setUploadedDocuments([]);
       setActiveQuestion('');
       setEditingStepId(null);
       setSelectedStepId(null);
@@ -998,8 +1139,10 @@ export default function App() {
     try { localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, newId); } catch {}
     setChatMessages([]);
     setSubprocesses([]);
+    setTraceDiagnosis(null);
     setModificationHistory([]);
     setTreePromptDrafts({});
+    setUploadedDocuments([]);
     setActiveQuestion('');
     setEditingStepId(null);
     setSelectedStepId(null);
@@ -1113,6 +1256,7 @@ export default function App() {
             : data.stages;
 
         setSubprocesses(completedStages);
+        setTraceDiagnosis(data.traceDiagnosis || data.trace_diagnosis || null);
         setCurrentRunningStepId(null);
         setCurrentRunningStepName('');
         setProgressInfo(null);
@@ -1130,6 +1274,7 @@ export default function App() {
           round: prev.length + 1,
           modifiedStepIndex: modifiedStepIndex ?? -1,
           stages: completedStages,
+          traceDiagnosis: data.traceDiagnosis || data.trace_diagnosis || null,
           timestamp: Date.now(),
         }]);
       }
@@ -1162,6 +1307,10 @@ export default function App() {
     if (!question.trim() || isLoading) return;
 
     const userQuestion = question.trim();
+    const activeDocumentIds = documentIdsForRun();
+    const documentLabel = uploadedDocuments.length
+      ? `\n\n已附带文档：${uploadedDocuments.map(doc => doc.filename).join('、')}`
+      : '';
 
     // 检查是否是修改指令
     if (subprocesses.length > 0 && handleModificationCommand(userQuestion)) {
@@ -1183,7 +1332,7 @@ export default function App() {
     setChatMessages(prev => [...prev, {
       id: Date.now().toString(),
       role: 'user',
-      content: userQuestion,
+      content: userQuestion + documentLabel,
       timestamp: new Date()
     }]);
 
@@ -1192,6 +1341,7 @@ export default function App() {
     setIsLoading(true);
     setError(null);
     setSubprocesses([]);
+    setTraceDiagnosis(null);
     setEditingStepId(null);
     setSelectedStepId(null);
     setRerunFromStep(null);
@@ -1203,7 +1353,7 @@ export default function App() {
     setTreeResetSignal(prev => prev + 1);
 
     try {
-      const response = await streamSolve({ question: userQuestion, reasoningEffort });
+      const response = await streamSolve({ question: userQuestion, reasoningEffort, documentIds: activeDocumentIds });
       if (!response.ok) throw new Error(`请求失败: ${response.status}`);
 
       const reader = response.body?.getReader();
@@ -1271,6 +1421,7 @@ export default function App() {
         modifiedOutputs,
         modifiedSteps,
         baseStages: commitBaseStages,
+        documentIds: documentIdsForRun(),
       });
       if (!response.ok) throw new Error(`请求失败: ${response.status}`);
 
@@ -1320,6 +1471,7 @@ export default function App() {
     const record = modificationHistory[roundIndex];
     // 将该round的stages加载到subprocesses显示
     setSubprocesses(record.stages);
+    setTraceDiagnosis(record.traceDiagnosis || null);
     setSelectedStepId(null);
     setTreePromptDrafts({});
     setTreePreviewResults([]);
@@ -1418,6 +1570,7 @@ export default function App() {
                 promptDrafts={treePromptDrafts}
                 previewResults={treePreviewResults}
                 previewFinalOutput={treePreviewFinalOutput}
+                traceDiagnosis={traceDiagnosis}
                 canUndoTreeChange={Boolean(treeEditSnapshot)}
                 isPreviewing={isTreePreviewing}
                 resetSignal={treeResetSignal}
@@ -1534,6 +1687,13 @@ export default function App() {
                 )}
 
                 {/* 决策子过程小卡片网格 */}
+                {subprocesses.length > 0 && (
+                  <AgentDiagnosisPanel
+                    steps={subprocesses}
+                    traceDiagnosis={traceDiagnosis}
+                  />
+                )}
+
                 <div className="grid grid-cols-2 gap-3">
                   {subprocesses.map((sub, idx) => {
                     const risk = riskColors[sub.riskLevel] || riskColors.medium;
@@ -1740,7 +1900,13 @@ export default function App() {
                                 <div>
                                   <div className="text-slate-400 mb-0.5">输出:</div>
                                   <div className="text-slate-600 bg-slate-50 rounded p-1.5 max-h-24 overflow-y-auto">
-                                    <pre className="whitespace-pre-wrap font-sans">{formatJsonToChinese(sub.output)}</pre>
+                                    <pre className="whitespace-pre-wrap font-sans">
+                                      <HighlightedEvidenceText
+                                        text={formatJsonToChinese(sub.output)}
+                                        evidence={sub.evidence_source}
+                                        active={sub.diagnosis_status === 'failure'}
+                                      />
+                                    </pre>
                                   </div>
                                 </div>
                               )}
@@ -1757,6 +1923,40 @@ export default function App() {
                                   实测影响：最终答案变化 {Math.round((sub.metricBasis.finalDelta || 0) * 100)}%，本步输出变化 {Math.round((sub.metricBasis.outputDelta || 0) * 100)}%
                                 </div>
                               )}
+                              <div className={clsx(
+                                'text-[11px] rounded p-1.5',
+                                sub.diagnosis_status === 'failure' && sub.affected_steps?.length
+                                  ? 'text-red-700 bg-red-50 border border-red-100'
+                                  : 'text-slate-500 bg-slate-50'
+                              )}>
+                                到哪里去：{sub.where_to_steps?.length ? `Step ${sub.where_to_steps.join(', Step ')}` : '没有直接下游步骤'}
+                              </div>
+                              {sub.diagnosis_status === 'failure' && (
+                                <div className="text-[11px] text-red-700 bg-red-50 border border-red-100 rounded p-1.5">
+                                  <div className="font-semibold">可能错误源：{sub.failure_label || sub.failure_type}</div>
+                                  {sub.evidence_source && (
+                                    <div className="mt-0.5 line-clamp-2">文字源头：{sub.evidence_source}</div>
+                                  )}
+                                  {sub.affected_steps?.length ? (
+                                    <div className="mt-0.5">影响到：Step {sub.affected_steps.join(', Step ')}</div>
+                                  ) : null}
+                                  {sub.where_to_steps?.length ? (
+                                    <div className="mt-0.5">到哪里去：Step {sub.where_to_steps.join(', Step ')}</div>
+                                  ) : null}
+                                </div>
+                              )}
+                              {sub.diagnosis_status === 'warning' && (
+                                <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded p-1.5">
+                                  性能/上下文提示：{sub.failure_label || sub.failure_type}
+                                  {sub.evidence_source ? ` · ${sub.evidence_source}` : ''}
+                                </div>
+                              )}
+                              {sub.diagnosis_status !== 'failure' && sub.potential_risks?.length ? (
+                                <div className="text-[11px] text-sky-700 bg-sky-50 border border-sky-100 rounded p-1.5">
+                                  <div className="font-semibold">可能风险：{sub.potential_issue_tags?.slice(0, 2).join('、') || sub.potential_risks[0].label}</div>
+                                  <div className="mt-0.5 line-clamp-2">{sub.potential_risks[0].reason}</div>
+                                </div>
+                              ) : null}
                               {sub.healthIssues?.length > 0 && (
                                 <div className="text-[11px] text-amber-600 bg-amber-50 rounded p-1.5">
                                   {sub.healthIssues[0]}
@@ -1970,6 +2170,66 @@ export default function App() {
 
           {/* 输入框 */}
           <div className="px-4 pb-4 bg-slate-50">
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDraggingDocument(true);
+              }}
+              onDragLeave={() => setIsDraggingDocument(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                uploadDocumentFiles(e.dataTransfer.files);
+              }}
+              className={clsx(
+                'mb-2 rounded-xl border border-dashed px-3 py-2 transition-colors',
+                isDraggingDocument ? 'border-sky-400 bg-sky-50' : 'border-slate-200 bg-white'
+              )}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept=".txt,.md,.markdown,.csv,.json,.log,.docx,.pdf"
+                className="hidden"
+                onChange={(e) => e.target.files && uploadDocumentFiles(e.target.files)}
+              />
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isUploadingDocument}
+                  className="flex items-center gap-2 rounded-lg px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  <svg className="h-4 w-4 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01.88-7.9A5 5 0 0117.9 9H18a3 3 0 010 6h-1m-5-5v10m0-10l-3 3m3-3l3 3" />
+                  </svg>
+                  {isUploadingDocument ? '正在解析文档...' : '拖入文档或点击上传'}
+                </button>
+                <span className="text-[10px] text-slate-400">txt/md/csv/docx；PDF 需后端安装 pypdf</span>
+              </div>
+              {uploadedDocuments.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {uploadedDocuments.map(doc => (
+                    <span
+                      key={doc.id}
+                      className="inline-flex max-w-full items-center gap-1 rounded-full border border-sky-100 bg-sky-50 px-2 py-1 text-[11px] text-sky-700"
+                      title={doc.preview}
+                    >
+                      <span className="max-w-[190px] truncate">{doc.filename}</span>
+                      <span className="text-sky-400">{doc.chunkCount}片段</span>
+                      <button
+                        type="button"
+                        onClick={() => setUploadedDocuments(prev => prev.filter(item => item.id !== doc.id))}
+                        className="ml-0.5 rounded-full px-1 text-sky-500 hover:bg-white hover:text-red-500"
+                        title="移除该文档"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
             <form onSubmit={(e) => { e.preventDefault(); executeSolve(); }} className="flex gap-2">
               <textarea
                 value={question}
@@ -1980,7 +2240,7 @@ export default function App() {
                     executeSolve();
                   }
                 }}
-                placeholder="输入问题，或：修改第1步输出为..."
+                placeholder="输入问题，或拖入文档后询问：分析这份文档哪里可能出错..."
                 rows={2}
                 disabled={isLoading}
                 className="flex-1 px-4 py-2 rounded-xl bg-white border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 resize-none"
@@ -2024,9 +2284,61 @@ export default function App() {
                 <div className="mb-2 text-xs font-semibold text-slate-500">Input</div>
                 <pre className="whitespace-pre-wrap font-sans leading-6 text-slate-700">{expandedInput || '（无）'}</pre>
               </section>
+              {expandedStep?.diagnosis_status && expandedStep.diagnosis_status !== 'normal' && (
+                <section className={clsx(
+                  'rounded-lg border p-3',
+                  expandedStep.diagnosis_status === 'failure'
+                    ? 'border-red-200 bg-red-50'
+                    : 'border-amber-200 bg-amber-50'
+                )}>
+                  <div className={clsx(
+                    'mb-2 text-xs font-semibold',
+                    expandedStep.diagnosis_status === 'failure' ? 'text-red-700' : 'text-amber-700'
+                  )}>
+                    {expandedStep.diagnosis_status === 'failure' ? '可能错误源' : '性能/上下文提示'}
+                  </div>
+                  <div className="space-y-2 text-sm leading-6 text-slate-700">
+                    <div>类型：{expandedStep.failure_label || expandedStep.failure_type}</div>
+                    {expandedStep.evidence_source && (
+                      <div>文字源头：{expandedStep.evidence_source}</div>
+                    )}
+                    {expandedStep.failure_reason && (
+                      <div>原因：{expandedStep.failure_reason}</div>
+                    )}
+                    {expandedStep.affected_steps?.length ? (
+                      <div>真实影响到：Step {expandedStep.affected_steps.join(', Step ')}</div>
+                    ) : null}
+                    <div>
+                      到哪里去：{expandedStep.where_to_steps?.length ? `Step ${expandedStep.where_to_steps.join(', Step ')}` : '没有直接下游步骤'}
+                    </div>
+                  </div>
+                </section>
+              )}
+              {expandedStep?.potential_risks?.length ? (
+                <section className="rounded-lg border border-sky-200 bg-sky-50 p-3">
+                  <div className="mb-2 text-xs font-semibold text-sky-700">可能出现的推理风险</div>
+                  <div className="space-y-2 text-sm leading-6 text-slate-700">
+                    {expandedStep.potential_risks.map((risk, idx) => (
+                      <div key={idx} className="rounded-md bg-white/70 p-2 ring-1 ring-sky-100">
+                        <div className="font-semibold text-sky-800">
+                          {risk.label || risk.failure_type} · {Math.round((risk.confidence || 0) * 100)}%
+                        </div>
+                        {risk.reason && <div className="mt-1">原因：{risk.reason}</div>}
+                        {risk.source_excerpt && <div className="mt-1">来源：{risk.source_excerpt}</div>}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
               <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                 <div className="mb-2 text-xs font-semibold text-slate-500">Output</div>
-                <pre className="whitespace-pre-wrap font-sans leading-6 text-slate-700">{formatJsonToChinese(expandedOutput) || '（无）'}</pre>
+                <pre className="whitespace-pre-wrap font-sans leading-6 text-slate-700">
+                  <HighlightedEvidenceText
+                    text={formatJsonToChinese(expandedOutput) || '（无）'}
+                    evidence={expandedStep?.evidence_source}
+                    active={expandedStep?.diagnosis_status === 'failure'}
+                  />
+                </pre>
               </section>
               <section className="rounded-lg border border-purple-100 bg-purple-50/60 p-3">
                 <div className="mb-2 text-xs font-semibold text-purple-600">System Prompt</div>

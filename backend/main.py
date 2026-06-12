@@ -7,7 +7,7 @@ AI Agent 推理可视化系统后端
 """
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any, Tuple
 from contextvars import ContextVar
@@ -19,6 +19,17 @@ from datetime import datetime
 import json
 import re
 import os
+import csv
+import hashlib
+import io
+import zipfile
+from urllib.parse import unquote
+from xml.etree import ElementTree
+
+try:
+    from .diagnosis import attach_diagnosis, diagnose_step, diagnose_trace
+except ImportError:
+    from diagnosis import attach_diagnosis, diagnose_step, diagnose_trace
 
 # 当前请求上下文里的 API Key / 模型 ID（每个请求独立）
 _request_api_key: ContextVar[Optional[str]] = ContextVar("request_api_key", default=None)
@@ -54,7 +65,7 @@ app.add_middleware(
     # allow_credentials 在 origin=* 时会被浏览器忽略，前端用 header 传 key 不依赖 cookie
     allow_credentials=False if _allowed_origins == ["*"] else True,
     allow_methods=["*"],
-    allow_headers=["*", "X-Ark-Api-Key", "X-Ark-Model"],
+    allow_headers=["*", "X-Ark-Api-Key", "X-Ark-Model", "X-File-Name", "X-File-Type"],
 )
 
 # 豆包 API 配置（按优先级使用）：
@@ -330,6 +341,7 @@ SKILL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
 
 class SolveRequest(BaseModel):
     question: str
+    documentIds: Optional[List[str]] = None
 
 class StreamSolveRequest(BaseModel):
     question: str
@@ -339,6 +351,20 @@ class StreamSolveRequest(BaseModel):
     baseStages: Optional[List[Dict[str, Any]]] = None
     previewMode: bool = False
     reasoningEffort: str = "medium"
+    documentIds: Optional[List[str]] = None
+
+class ResearchCaseSaveRequest(BaseModel):
+    title: Optional[str] = None
+    objective: Optional[str] = None
+    caseType: Optional[str] = "current_session"
+    question: Optional[str] = None
+    notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+    expectedFailureTypes: Optional[List[str]] = None
+    subprocesses: Optional[List[Dict[str, Any]]] = None
+    traceDiagnosis: Optional[Dict[str, Any]] = None
+    replayRecords: Optional[List[Dict[str, Any]]] = None
+    uploadedDocuments: Optional[List[Dict[str, Any]]] = None
 
 class UpdateSkillRequest(BaseModel):
     name: Optional[str] = None
@@ -373,6 +399,440 @@ EXECUTION_HISTORY: List[Dict[str, Any]] = []
 
 # 统计信息（真实数据）
 STATS: Dict[str, Dict[str, Any]] = {}
+
+# 上传文档只保存在当前后端进程内，避免把原文写入仓库或日志。
+DOCUMENT_STORE: Dict[str, Dict[str, Any]] = {}
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+MAX_DOCUMENT_CONTEXT_CHARS = 5200
+
+# 研究级 failure case，同样只保存在当前后端进程内，便于本地复现实验。
+RESEARCH_CASES: Dict[str, Dict[str, Any]] = {}
+
+
+def compact_report_text(value: Any, limit: int = 900) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...（已在 UI/JSON 中保留完整内容）"
+
+
+def failure_case_template() -> Dict[str, Any]:
+    return {
+        "schemaVersion": "research_case_v1",
+        "requiredFields": [
+            "title",
+            "objective",
+            "question",
+            "input_artifacts",
+            "expected_failure_types",
+            "observed_failure_types",
+            "step_diagnosis",
+            "replay_records",
+            "fix_hypotheses",
+        ],
+        "failureTaxonomy": [
+            "fact_error",
+            "unsupported_claim",
+            "tool_misuse",
+            "retrieval_miss",
+            "planning_error",
+            "self_inconsistency",
+            "constraint_violation",
+            "format_error",
+            "hallucination",
+            "invalid_retry",
+            "cost_latency_anomaly",
+            "memory_pollution",
+            "context_omission",
+        ],
+        "reproductionChecklist": [
+            "保存原始问题和上传文档/日志摘要",
+            "保存每个 step 的输入、输出、失败类型、证据源和 provenance 边",
+            "至少保存一次 replay：改了哪个 step、改前/改后最终输出、影响到哪些下游 step",
+            "导出报告时保留 trace summary、step 级错误、真实证据和修复假设",
+        ],
+    }
+
+
+def summarize_stage_for_case(stage: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": stage.get("id"),
+        "order": stage.get("order"),
+        "name": stage.get("name") or stage.get("skill"),
+        "stage": stage.get("stage"),
+        "diagnosis_status": stage.get("diagnosis_status"),
+        "failure_type": stage.get("failure_type"),
+        "failure_label": stage.get("failure_label"),
+        "failure_confidence": stage.get("failure_confidence"),
+        "evidence_source": stage.get("evidence_source"),
+        "failure_reason_summary": stage.get("failure_reason_summary"),
+        "failure_reason": stage.get("failure_reason"),
+        "where_to_steps": stage.get("where_to_steps") or [],
+        "affected_steps": stage.get("affected_steps") or [],
+        "input": stage.get("input"),
+        "output": stage.get("output"),
+        "provenance_nodes": stage.get("provenance_nodes") or [],
+        "provenance_edges": stage.get("provenance_edges") or [],
+        "potential_risks": stage.get("potential_risks") or [],
+        "suggested_fix": stage.get("suggested_fix") or [],
+    }
+
+
+def build_research_case_from_payload(payload: ResearchCaseSaveRequest) -> Dict[str, Any]:
+    stages = payload.subprocesses if payload.subprocesses is not None else CURRENT_SESSION.get("subprocesses", [])
+    trace = payload.traceDiagnosis if payload.traceDiagnosis is not None else CURRENT_SESSION.get("traceDiagnosis")
+    question = payload.question or CURRENT_SESSION.get("question") or ""
+    observed_failure_types = sorted({
+        str(stage.get("failure_type"))
+        for stage in stages
+        if stage.get("failure_type") and stage.get("failure_type") != "none"
+    })
+    case_id = "case_" + hashlib.sha1(f"{payload.title}:{question}:{datetime.now().isoformat()}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+    replay_records = payload.replayRecords or []
+    documents = payload.uploadedDocuments or [
+        {
+            "id": doc_id,
+            "filename": DOCUMENT_STORE[doc_id].get("filename"),
+            "charCount": len(DOCUMENT_STORE[doc_id].get("text", "")),
+            "chunkCount": len(DOCUMENT_STORE[doc_id].get("chunks", [])),
+        }
+        for doc_id in (CURRENT_SESSION.get("documentIds") or [])
+        if doc_id in DOCUMENT_STORE
+    ]
+    return {
+        "id": case_id,
+        "schemaVersion": "research_case_v1",
+        "title": payload.title or (question[:28] + ("..." if len(question) > 28 else "")) or "未命名 failure case",
+        "objective": payload.objective or "复现并解释一次 Agent 推理失败，定位 failure type、证据来源和下游传播。",
+        "caseType": payload.caseType or "current_session",
+        "question": question,
+        "notes": payload.notes or "",
+        "tags": payload.tags or [],
+        "createdAt": datetime.now().isoformat(),
+        "input_artifacts": {
+            "documents": documents,
+            "executionId": CURRENT_SESSION.get("executionId"),
+            "historySize": len(EXECUTION_HISTORY),
+        },
+        "expected_failure_types": payload.expectedFailureTypes or [],
+        "observed_failure_types": observed_failure_types,
+        "traceDiagnosis": trace,
+        "step_diagnosis": [summarize_stage_for_case(stage) for stage in stages],
+        "replay_records": replay_records,
+        "fix_hypotheses": [
+            fix
+            for stage in stages
+            for fix in (stage.get("suggested_fix") or [])
+        ][:12],
+    }
+
+
+def render_case_report(case: Dict[str, Any]) -> str:
+    trace = case.get("traceDiagnosis") or {}
+    lines = [
+        f"# Research Failure Case: {case.get('title')}",
+        "",
+        "## 1. Case Metadata",
+        f"- Case ID: `{case.get('id')}`",
+        f"- Created At: {case.get('createdAt')}",
+        f"- Type: {case.get('caseType')}",
+        f"- Tags: {', '.join(case.get('tags') or []) or '无'}",
+        "",
+        "## 2. Research Objective",
+        compact_report_text(case.get("objective"), 1200),
+        "",
+        "## 3. Original Question",
+        compact_report_text(case.get("question"), 1800),
+        "",
+        "## 4. Failure Taxonomy",
+        f"- Expected: {', '.join(case.get('expected_failure_types') or []) or '未预设'}",
+        f"- Observed: {', '.join(case.get('observed_failure_types') or []) or '未观察到明确失败'}",
+        f"- Trace Status: {trace.get('overall_status') or 'unknown'}",
+        f"- Main Failure: {trace.get('main_failure_label') or trace.get('main_failure_type') or 'unknown'}",
+        f"- Summary: {trace.get('summary') or '无'}",
+        "",
+        "## 5. Step-Level Diagnosis",
+    ]
+    for step in case.get("step_diagnosis") or []:
+        risks = step.get("potential_risks") or []
+        lines.extend([
+            "",
+            f"### Step {step.get('order')}: {step.get('name')}",
+            f"- Status: {step.get('diagnosis_status') or 'normal'}",
+            f"- Failure Type: {step.get('failure_label') or step.get('failure_type') or 'none'}",
+            f"- Confidence: {step.get('failure_confidence') if step.get('failure_confidence') is not None else 'n/a'}",
+            f"- Where To: {', '.join('Step ' + str(item) for item in (step.get('where_to_steps') or [])) or '无直接下游'}",
+            f"- Affected Steps: {', '.join('Step ' + str(item) for item in (step.get('affected_steps') or [])) or '无'}",
+            f"- Evidence Source: {compact_report_text(step.get('evidence_source'), 1200) or '无'}",
+            f"- Why/How: {compact_report_text(step.get('failure_reason') or step.get('failure_reason_summary'), 1200) or '无'}",
+        ])
+        if risks:
+            lines.append("- Potential Risks:")
+            for risk in risks[:4]:
+                lines.append(f"  - {risk.get('label') or risk.get('failure_type')}: {compact_report_text(risk.get('reason') or risk.get('reason_summary'), 500)}")
+    lines.extend(["", "## 6. Replay / Counterfactual Records"])
+    replay_records = case.get("replay_records") or []
+    if not replay_records:
+        lines.append("暂无 replay 记录。")
+    for record in replay_records:
+        lines.extend([
+            "",
+            f"### Replay: Step {record.get('stepOrder')} {record.get('stepName')}",
+            f"- Prompt Change: {compact_report_text(record.get('promptSummary'), 600)}",
+            f"- Changed Steps: {record.get('changedSteps') or []}",
+            f"- Affected Steps: {record.get('affectedSteps') or []}",
+            f"- Final Delta: {record.get('finalDelta')}%",
+            f"- Before: {compact_report_text(record.get('finalBeforeFull') or record.get('finalBefore'), 1000)}",
+            f"- After: {compact_report_text(record.get('finalAfterFull') or record.get('finalAfter'), 1000)}",
+        ])
+    lines.extend(["", "## 7. Fix Hypotheses"])
+    fixes = case.get("fix_hypotheses") or []
+    if fixes:
+        lines.extend([f"- {fix}" for fix in fixes])
+    else:
+        lines.append("暂无修复假设。")
+    if case.get("notes"):
+        lines.extend(["", "## 8. Notes", compact_report_text(case.get("notes"), 1600)])
+    return "\n".join(lines) + "\n"
+
+
+def build_demo_research_cases() -> List[Dict[str, Any]]:
+    demo_payloads = [
+        ResearchCaseSaveRequest(
+            title="Demo Case 1: 上线状态证据不足",
+            objective="验证系统能把“正式上线”这类状态判断定位为证据不足，而不是把摘要里的完成字样当作事实。",
+            caseType="demo_reproduction",
+            question="请根据服务目录确认云岚社区健康服务平台二期目前已正式上线的核心功能有哪些？",
+            expectedFailureTypes=["retrieval_miss", "unsupported_claim"],
+            tags=["demo", "evidence", "status"],
+            subprocesses=[
+                {"id": "demo1_step1", "order": 1, "name": "识别问题对象与状态字段", "input": "用户要求确认二期正式上线功能", "output": "需要检查服务目录中的功能名称和上线状态。", "diagnosis_status": "normal", "failure_type": "none", "where_to_steps": [2]},
+                {"id": "demo1_step2", "order": 2, "name": "检索服务目录证据", "input": "查找正式上线状态", "output": "只看到摘要写有已完成建设，未找到服务目录表或上线状态字段。", "diagnosis_status": "failure", "failure_type": "retrieval_miss", "failure_label": "证据缺失", "failure_confidence": 0.82, "evidence_source": "当前输出只提到“已完成建设”，没有文件名、表格行号或“正式上线”状态字段。", "failure_reason": "本步需要证明哪些功能正式上线，但检索结果没有拿到服务目录确认表或上线状态字段，所以后续不能直接下结论。", "where_to_steps": [3, 4], "affected_steps": [3, 4], "suggested_fix": ["要求检索步骤必须输出文件名、表格行号、功能名称和上线状态；找不到时写“证据不足”。"]},
+                {"id": "demo1_step3", "order": 3, "name": "生成上线功能清单", "input": "使用 Step 2 证据", "output": "把已完成建设误写成正式上线。", "diagnosis_status": "warning", "failure_type": "unsupported_claim", "failure_label": "无证据断言", "failure_confidence": 0.68, "evidence_source": "Step 2 没有给出上线状态字段。", "where_to_steps": [4]},
+                {"id": "demo1_step4", "order": 4, "name": "最终核验", "input": "核验清单", "output": "应要求补充服务目录表。", "diagnosis_status": "normal", "failure_type": "none"},
+            ],
+            traceDiagnosis={"overall_status": "partial_failure", "main_failure_type": "retrieval_miss", "main_failure_label": "证据缺失", "summary": "上线状态的关键证据没有进入检索步骤，后续生成步骤存在无证据断言风险。"},
+            replayRecords=[{"stepOrder": 2, "stepName": "检索服务目录证据", "promptSummary": "强制输出文件名、表格行号、功能名称、上线状态；没有就写证据不足。", "changedSteps": [2, 3], "affectedSteps": [3, 4], "finalDelta": 46, "finalBefore": "列出已完成建设功能", "finalAfter": "无法确认正式上线功能，需补充服务目录确认表。"}],
+        ),
+        ResearchCaseSaveRequest(
+            title="Demo Case 2: API 429 后继续生成结论",
+            objective="验证工具/API 失败后是否停止后续业务结论生成，并把错误码传播到后续 step。",
+            caseType="demo_reproduction",
+            question="根据最新接口日志总结今天失败最多的支付错误类型。",
+            expectedFailureTypes=["tool_misuse"],
+            tags=["demo", "api", "log"],
+            subprocesses=[
+                {"id": "demo2_step1", "order": 1, "name": "确定日志查询范围", "input": "今天支付错误", "output": "需要查询 payment error logs。", "diagnosis_status": "normal", "failure_type": "none", "where_to_steps": [2]},
+                {"id": "demo2_step2", "order": 2, "name": "调用日志接口", "input": "payment error logs", "output": "API调用失败: 429 - SetLimitExceeded", "diagnosis_status": "failure", "failure_type": "tool_misuse", "failure_label": "工具/API调用失败", "failure_confidence": 0.93, "evidence_source": "API调用失败: 429 - SetLimitExceeded", "failure_reason": "日志接口返回额度限制，当前没有真实日志结果。后续如果继续统计错误类型，就是基于失败工具结果的虚构结论。", "where_to_steps": [3, 4], "affected_steps": [3, 4], "suggested_fix": ["工具失败时停止生成业务统计结论，只输出错误码、失败接口和需要重试的条件。"]},
+                {"id": "demo2_step3", "order": 3, "name": "聚合错误类型", "input": "使用 Step 2 日志", "output": "无法聚合，因为日志接口失败。", "diagnosis_status": "normal", "failure_type": "none"},
+                {"id": "demo2_step4", "order": 4, "name": "输出报告", "input": "聚合结果", "output": "报告应提示 API 额度限制。", "diagnosis_status": "normal", "failure_type": "none"},
+            ],
+            traceDiagnosis={"overall_status": "failure", "main_failure_type": "tool_misuse", "main_failure_label": "工具/API调用失败", "summary": "真实失败来自日志接口 429，后续 step 应停止生成统计结论。"},
+            replayRecords=[{"stepOrder": 2, "stepName": "调用日志接口", "promptSummary": "工具失败时输出错误边界并停止后续事实结论。", "changedSteps": [2, 3, 4], "affectedSteps": [3, 4], "finalDelta": 61, "finalBefore": "支付超时最多", "finalAfter": "API 429，无法确认今天失败最多的支付错误类型。"}],
+        ),
+        ResearchCaseSaveRequest(
+            title="Demo Case 3: 长文档上下文遗漏",
+            objective="验证前序文档片段中出现的硬约束是否被后续步骤继承。",
+            caseType="demo_reproduction",
+            question="根据上传的活动方案，生成对外宣传文案，但不能出现价格承诺和未审批合作方名称。",
+            expectedFailureTypes=["context_omission", "constraint_violation"],
+            tags=["demo", "context", "constraint"],
+            subprocesses=[
+                {"id": "demo3_step1", "order": 1, "name": "提取硬约束", "input": "上传活动方案", "output": "硬约束：不能出现价格承诺；不能出现未审批合作方名称。", "diagnosis_status": "normal", "failure_type": "none", "where_to_steps": [2, 3]},
+                {"id": "demo3_step2", "order": 2, "name": "生成宣传文案", "input": "活动亮点", "output": "文案包含“最低价保障”和合作方 A。", "diagnosis_status": "failure", "failure_type": "context_omission", "failure_label": "关键上下文遗漏", "failure_confidence": 0.79, "evidence_source": "Step 1 已提取“不能出现价格承诺；不能出现未审批合作方名称”，但 Step 2 输出出现“最低价保障”和合作方 A。", "failure_reason": "上游硬约束没有被带入生成步骤，导致输出违反用户明确限制。", "where_to_steps": [3], "affected_steps": [3], "suggested_fix": ["生成步骤的输入必须显式包含硬约束清单，并在输出前逐条自检。"]},
+                {"id": "demo3_step3", "order": 3, "name": "约束核验", "input": "检查宣传文案", "output": "发现价格承诺和未审批合作方名称。", "diagnosis_status": "failure", "failure_type": "constraint_violation", "failure_label": "约束违反", "failure_confidence": 0.86, "evidence_source": "输出文本包含“最低价保障”和合作方 A。", "failure_reason": "最终核验能看到明确违规文本，应标红并阻止作为最终答案。"},
+            ],
+            traceDiagnosis={"overall_status": "failure", "main_failure_type": "context_omission", "main_failure_label": "关键上下文遗漏", "summary": "硬约束在 Step 1 出现，但未进入 Step 2 生成输入，导致文案违反约束。"},
+            replayRecords=[{"stepOrder": 2, "stepName": "生成宣传文案", "promptSummary": "把 Step 1 的硬约束原样带入生成输入，并要求逐条自检。", "changedSteps": [2, 3], "affectedSteps": [3], "finalDelta": 52, "finalBefore": "最低价保障，合作方 A 联合推出", "finalAfter": "删除价格承诺和未审批合作方名称，输出合规文案。"}],
+        ),
+    ]
+    return [build_research_case_from_payload(payload) for payload in demo_payloads]
+
+
+def decode_text_bytes(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="ignore")
+
+
+def extract_docx_text(data: bytes) -> str:
+    paragraphs: List[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            xml_bytes = archive.read("word/document.xml")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"无法读取 DOCX 内容：{exc}") from exc
+
+    try:
+        root = ElementTree.fromstring(xml_bytes)
+    except ElementTree.ParseError as exc:
+        raise HTTPException(status_code=400, detail=f"DOCX XML 解析失败：{exc}") from exc
+
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    for paragraph in root.findall(".//w:p", namespace):
+        parts: List[str] = []
+        for node in paragraph.iter():
+            if node.tag.endswith("}t") and node.text:
+                parts.append(node.text)
+            elif node.tag.endswith("}tab"):
+                parts.append("\t")
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs)
+
+
+def extract_pdf_text(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except Exception as exc:
+        raise HTTPException(
+            status_code=415,
+            detail="当前后端未安装 pypdf，暂时无法解析 PDF。请先上传 txt/md/csv/docx，或安装 pypdf 后重启后端。"
+        ) from exc
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = []
+        for index, page in enumerate(reader.pages):
+            text = page.extract_text() or ""
+            if text.strip():
+                pages.append(f"【第 {index + 1} 页】\n{text.strip()}")
+        return "\n\n".join(pages)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"PDF 解析失败：{exc}") from exc
+
+
+def extract_uploaded_document_text(filename: str, content_type: str, data: bytes) -> str:
+    suffix = os.path.splitext(filename.lower())[1]
+    if suffix in {".txt", ".md", ".markdown", ".json", ".log"} or content_type.startswith("text/"):
+        return decode_text_bytes(data)
+    if suffix == ".csv":
+        raw = decode_text_bytes(data)
+        rows = list(csv.reader(io.StringIO(raw)))
+        return "\n".join(" | ".join(cell.strip() for cell in row) for row in rows)
+    if suffix == ".docx":
+        return extract_docx_text(data)
+    if suffix == ".pdf":
+        return extract_pdf_text(data)
+    fallback = decode_text_bytes(data).strip()
+    if fallback:
+        return fallback
+    raise HTTPException(status_code=415, detail=f"暂不支持该文件类型：{suffix or content_type or 'unknown'}")
+
+
+def chunk_document_text(text: str, chunk_size: int = 900, overlap: int = 120) -> List[Dict[str, Any]]:
+    clean = re.sub(r"\r\n?", "\n", text or "").strip()
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", clean) if p.strip()]
+    chunks: List[Dict[str, Any]] = []
+    buffer = ""
+
+    def flush_buffer():
+        nonlocal buffer
+        content = buffer.strip()
+        if content:
+            chunks.append({
+                "index": len(chunks) + 1,
+                "text": content,
+                "preview": re.sub(r"\s+", " ", content)[:160],
+            })
+        buffer = ""
+
+    for paragraph in paragraphs or [clean]:
+        if len(paragraph) > chunk_size:
+            flush_buffer()
+            start = 0
+            while start < len(paragraph):
+                piece = paragraph[start:start + chunk_size].strip()
+                if piece:
+                    chunks.append({
+                        "index": len(chunks) + 1,
+                        "text": piece,
+                        "preview": re.sub(r"\s+", " ", piece)[:160],
+                    })
+                start += max(1, chunk_size - overlap)
+            continue
+        if len(buffer) + len(paragraph) + 2 > chunk_size:
+            flush_buffer()
+        buffer = f"{buffer}\n\n{paragraph}".strip()
+    flush_buffer()
+    return chunks
+
+
+def tokenize_for_retrieval(text: str) -> List[str]:
+    lowered = (text or "").lower()
+    latin = re.findall(r"[a-z0-9_]{2,}", lowered)
+    cjk = re.findall(r"[\u4e00-\u9fff]{2,}", lowered)
+    cjk_terms: List[str] = []
+    for token in cjk:
+        cjk_terms.extend(token[i:i + 2] for i in range(max(0, len(token) - 1)))
+        if len(token) >= 3:
+            cjk_terms.extend(token[i:i + 3] for i in range(max(0, len(token) - 2)))
+    return latin + cjk_terms
+
+
+def retrieve_document_context(question: str, document_ids: Optional[List[str]]) -> str:
+    if not document_ids:
+        return ""
+    query_terms = tokenize_for_retrieval(question)
+    query_set = set(query_terms)
+    candidates: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    selected_docs = [DOCUMENT_STORE[doc_id] for doc_id in document_ids if doc_id in DOCUMENT_STORE]
+    if not selected_docs:
+        return ""
+
+    for doc in selected_docs:
+        for chunk in doc.get("chunks", []):
+            chunk_terms = tokenize_for_retrieval(chunk.get("text", ""))
+            if query_set and chunk_terms:
+                overlap = sum(1 for term in chunk_terms if term in query_set)
+                score = overlap / max(8, len(set(chunk_terms)))
+            else:
+                score = 0.01 if not candidates else 0.0
+            if score > 0:
+                candidates.append((score, doc, chunk))
+
+    if not candidates:
+        for doc in selected_docs:
+            for chunk in doc.get("chunks", [])[:2]:
+                candidates.append((0.01, doc, chunk))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    blocks: List[str] = []
+    total = 0
+    for _, doc, chunk in candidates[:8]:
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+        block = f"[{doc['filename']} · 片段 {chunk['index']}]\n{text}"
+        if total + len(block) > MAX_DOCUMENT_CONTEXT_CHARS:
+            remaining = MAX_DOCUMENT_CONTEXT_CHARS - total
+            if remaining <= 240:
+                break
+            block = block[:remaining]
+        blocks.append(block)
+        total += len(block)
+        if total >= MAX_DOCUMENT_CONTEXT_CHARS:
+            break
+    return "\n\n".join(blocks)
+
+
+def build_question_with_documents(question: str, document_ids: Optional[List[str]]) -> str:
+    context = retrieve_document_context(question, document_ids)
+    if not context:
+        return question
+    return (
+        f"{question}\n\n"
+        "【已上传文档的相关片段】\n"
+        f"{context}\n\n"
+        "【使用要求】\n"
+        "1. 文档能支持的结论必须引用文件名和片段编号。\n"
+        "2. 文档没有证据时要明确写“文档证据不足”，不能编造。\n"
+        "3. 后续 when/where/why/how 诊断需要优先追踪这些文档片段。"
+    )
 
 # ==================== 豆包API调用 ====================
 
@@ -740,6 +1200,42 @@ def apply_measured_impacts(
     return stages
 
 
+def apply_diagnosis_to_health(stage: Dict[str, Any]) -> Dict[str, Any]:
+    """让健康度和诊断结果一致：内容错误源不能继续显示高健康度。"""
+    status = stage.get("diagnosis_status")
+    if status == "failure":
+        current = int(stage.get("healthScore") or 80)
+        stage["healthScore"] = min(current, 48)
+        stage["health"] = "red" if stage["healthScore"] < 45 else "yellow"
+        issue = stage.get("failure_label") or stage.get("failure_type") or "诊断发现内容错误源"
+        issues = list(stage.get("healthIssues") or [])
+        if issue not in issues:
+            issues.insert(0, issue)
+        stage["healthIssues"] = issues
+    elif status == "warning":
+        current = int(stage.get("healthScore") or 80)
+        stage["healthScore"] = min(current, 72)
+        if stage.get("health") == "green":
+            stage["health"] = "yellow"
+    elif stage.get("potential_risks"):
+        current = int(stage.get("healthScore") or 80)
+        strongest = max(
+            (float(item.get("confidence") or 0) for item in stage.get("potential_risks", [])),
+            default=0.0
+        )
+        stage["healthScore"] = min(current, 78 if strongest >= 0.68 else 86)
+        if stage.get("health") == "green" and strongest >= 0.68:
+            stage["health"] = "yellow"
+        tags = stage.get("potential_issue_tags") or []
+        if tags:
+            issues = list(stage.get("healthIssues") or [])
+            issue = f"潜在推理风险：{', '.join(tags[:2])}"
+            if issue not in issues:
+                issues.insert(0, issue)
+            stage["healthIssues"] = issues
+    return stage
+
+
 def stage_to_subprocess(stage: Dict[str, Any], index: int) -> Dict[str, Any]:
     """将前端传回的上一版 stage 还原为可执行步骤，避免重跑时重新规划漂移。"""
     user_template = stage.get("userPromptTemplate") or "问题：{question}\n\n已知：\n{previous_output}"
@@ -885,6 +1381,7 @@ async def generate_solve_events(
     reasoning_effort: str = "medium",
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
+    document_ids: Optional[List[str]] = None,
 ):
     """生成SSE事件流
 
@@ -904,7 +1401,7 @@ async def generate_solve_events(
     try:
         async for chunk in _generate_solve_events_inner(
             question, start_step_index, modified_outputs, modified_steps,
-            base_stages, preview_mode, reasoning_effort
+            base_stages, preview_mode, reasoning_effort, document_ids
         ):
             yield chunk
     finally:
@@ -921,11 +1418,13 @@ async def _generate_solve_events_inner(
     modified_steps: dict = None,
     base_stages: Optional[List[Dict[str, Any]]] = None,
     preview_mode: bool = False,
-    reasoning_effort: str = "medium"
+    reasoning_effort: str = "medium",
+    document_ids: Optional[List[str]] = None,
 ):
     """SSE 事件生成器（内层），由 generate_solve_events 包裹注入 ContextVar"""
     execution_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now().isoformat()
+    model_question = build_question_with_documents(question, document_ids)
 
     if base_stages is None and start_step_index > 0:
         session_stages = CURRENT_SESSION.get("subprocesses") or []
@@ -945,27 +1444,31 @@ async def _generate_solve_events_inner(
         ])
     else:
         yield f"event: planning\ndata: {json.dumps({'message': '正在分析问题并规划推理步骤...'})}\n\n"
-        subprocesses = await plan_subprocesses(question)
+        subprocesses = await plan_subprocesses(model_question)
 
     start_step_index = max(0, min(start_step_index, len(subprocesses) - 1 if subprocesses else 0))
     run_subprocesses = subprocesses[start_step_index:] if subprocesses else []
 
     # 发送规划完成事件
-    yield f"event: plan_complete\ndata: {json.dumps({'subprocesses': [
-        {
-            'id': s['id'],
-            'name': s['name'],
-            'skill': s.get('skill', s.get('name', '')),
-            'risk_level': s['risk_level'],
-            'reasoning': s['reasoning'],
-            'systemPrompt': s.get('system_prompt', ''),
-            'userPrompt': s.get('user_template', '')
-        } for s in subprocesses
-    ]})}\n\n"
+    plan_payload = {
+        "subprocesses": [
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "skill": s.get("skill", s.get("name", "")),
+                "risk_level": s["risk_level"],
+                "reasoning": s["reasoning"],
+                "systemPrompt": s.get("system_prompt", ""),
+                "userPrompt": s.get("user_template", ""),
+            }
+            for s in subprocesses
+        ]
+    }
+    yield f"event: plan_complete\ndata: {json.dumps(plan_payload)}\n\n"
     
     preserved_stages = [dict(stage) for stage in (base_stages or [])[:start_step_index]]
     stages = preserved_stages.copy()
-    current_output = stages[-1].get("output", question) if stages else question
+    current_output = stages[-1].get("output", model_question) if stages else model_question
     total_stages = max(len(subprocesses), 1)
     total_run_stages = max(len(run_subprocesses), 1)
 
@@ -977,16 +1480,17 @@ async def _generate_solve_events_inner(
         risk_score = float(subprocess.get("risk_score", risk_level_to_score(risk_level)))
 
         # 发送阶段开始事件
-        yield f"event: stage_start\ndata: {json.dumps({
-            'stageId': subprocess_id,
-            'name': subprocess_name,
-            'skill': subprocess.get('skill', subprocess_name),
-            'riskLevel': risk_level,
-            'riskScore': round(risk_score * 100),
-            'order': subprocess["order"],
-            'progress': (absolute_index / total_stages) * 100,
-            'reasoning': subprocess.get("reasoning", "")
-        })}\n\n"
+        stage_start_payload = {
+            "stageId": subprocess_id,
+            "name": subprocess_name,
+            "skill": subprocess.get("skill", subprocess_name),
+            "riskLevel": risk_level,
+            "riskScore": round(risk_score * 100),
+            "order": subprocess["order"],
+            "progress": (absolute_index / total_stages) * 100,
+            "reasoning": subprocess.get("reasoning", ""),
+        }
+        yield f"event: stage_start\ndata: {json.dumps(stage_start_payload)}\n\n"
 
         # 更新当前会话状态。试运行只返回临时预览，不污染正式会话。
         if not preview_mode:
@@ -1016,11 +1520,11 @@ async def _generate_solve_events_inner(
 
         try:
             user_content = model_user_template.format(
-                question=question,
+                question=model_question,
                 previous_output=model_step_input
             )
         except (KeyError, ValueError):
-            user_content = f"{model_user_template}\n\n问题：{question}\n\n已知：\n{model_step_input}"
+            user_content = f"{model_user_template}\n\n问题：{model_question}\n\n已知：\n{model_step_input}"
         if preview_mode:
             user_content = compact_for_model(user_content, 1600)
         messages = [{"role": "system", "content": model_system_prompt}]
@@ -1138,6 +1642,8 @@ async def _generate_solve_events_inner(
             "reasoning": subprocess.get("reasoning", ""),
             "modified": bool(step_mod) or (modified_outputs is not None and subprocess_id in modified_outputs)  # 标记是否有修改
         }
+        stage_data.update(diagnose_step(stage_data, stages + [stage_data]))
+        stage_data = apply_diagnosis_to_health(stage_data)
         
         stages.append(stage_data)
         
@@ -1148,13 +1654,16 @@ async def _generate_solve_events_inner(
         
         # 发送阶段完成事件
         yield f"event: stage_complete\ndata: {json.dumps({'stage': stage_data, 'progress': ((idx + 1) / total_run_stages) * 100})}\n\n"
-    stages = apply_measured_impacts(stages, base_stages, start_step_index)
+    stages = [apply_diagnosis_to_health(stage) for stage in attach_diagnosis(apply_measured_impacts(stages, base_stages, start_step_index))]
+    trace_diagnosis = diagnose_trace(stages)
 
     # 更新当前会话
     if not preview_mode:
         CURRENT_SESSION.update({
             "question": question,
+            "documentIds": document_ids or [],
             "subprocesses": stages,
+            "traceDiagnosis": trace_diagnosis,
             "executionId": execution_id,
             "timestamp": timestamp,
             "currentSubprocess": None,
@@ -1167,7 +1676,8 @@ async def _generate_solve_events_inner(
             "timestamp": timestamp,
             "question": question,
             "stages": stages,
-            "finalOutput": stages[-1]["output"] if stages else ""
+            "finalOutput": stages[-1]["output"] if stages else "",
+            "traceDiagnosis": trace_diagnosis
         })
     
     # 提取最终答案（从最终步骤的输出中提取有意义的内容）
@@ -1181,14 +1691,16 @@ async def _generate_solve_events_inner(
     ]) if stages else ""
 
     # 发送完成事件
-    yield f"event: complete\ndata: {json.dumps({
-        'executionId': execution_id,
-        'timestamp': timestamp,
-        'stages': stages,
-        'finalOutput': final_answer,
-        'finalOutputFull': stages[-1]['output'] if stages else "",
-        'allStagesOutput': all_stages_output
-    })}\n\n"
+    complete_payload = {
+        "executionId": execution_id,
+        "timestamp": timestamp,
+        "stages": stages,
+        "traceDiagnosis": trace_diagnosis,
+        "finalOutput": final_answer,
+        "finalOutputFull": stages[-1]["output"] if stages else "",
+        "allStagesOutput": all_stages_output,
+    }
+    yield f"event: complete\ndata: {json.dumps(complete_payload)}\n\n"
 
 
 def extract_final_answer(output: str) -> str:
@@ -1302,6 +1814,64 @@ async def get_stats():
         })
     return {"stats": result}
 
+
+@app.post("/api/documents/upload")
+async def upload_document(request: Request):
+    """上传并解析文档。为避免额外 multipart 依赖，文件二进制直接放在 request body。"""
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"文件过大，当前上限为 {MAX_UPLOAD_BYTES // 1024 // 1024}MB")
+
+    raw_filename = request.headers.get("X-File-Name") or "uploaded.txt"
+    filename = unquote(raw_filename).strip() or "uploaded.txt"
+    content_type = request.headers.get("X-File-Type") or ""
+    text = extract_uploaded_document_text(filename, content_type, data).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="未能从文档中解析出可用文字")
+
+    chunks = chunk_document_text(text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="文档内容过短，无法分块")
+
+    doc_id = "doc_" + hashlib.sha1(f"{filename}:{len(data)}:{text[:500]}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+    DOCUMENT_STORE[doc_id] = {
+        "id": doc_id,
+        "filename": filename,
+        "contentType": content_type,
+        "size": len(data),
+        "text": text,
+        "chunks": chunks,
+        "uploadedAt": datetime.now().isoformat(),
+    }
+    return {
+        "id": doc_id,
+        "filename": filename,
+        "size": len(data),
+        "charCount": len(text),
+        "chunkCount": len(chunks),
+        "preview": chunks[0]["preview"],
+    }
+
+
+@app.get("/api/documents")
+async def list_documents():
+    return {
+        "documents": [
+            {
+                "id": doc["id"],
+                "filename": doc["filename"],
+                "size": doc["size"],
+                "charCount": len(doc.get("text", "")),
+                "chunkCount": len(doc.get("chunks", [])),
+                "uploadedAt": doc.get("uploadedAt"),
+            }
+            for doc in DOCUMENT_STORE.values()
+        ]
+    }
+
+
 @app.get("/api/solve/stream")
 async def solve_stream(
     question: str,
@@ -1312,6 +1882,7 @@ async def solve_stream(
     useSessionBase: bool = False,
     previewMode: bool = False,
     reasoningEffort: str = "medium",
+    documentIds: str = None,
     apiKey: Optional[str] = None,
     model: Optional[str] = None,
     x_ark_api_key: Optional[str] = Header(None, alias="X-Ark-Api-Key"),
@@ -1357,6 +1928,15 @@ async def solve_stream(
     elif useSessionBase and CURRENT_SESSION.get("question") == question:
         parsed_base_stages = CURRENT_SESSION.get("subprocesses") or None
 
+    parsed_document_ids: Optional[List[str]] = None
+    if documentIds:
+        try:
+            loaded_ids = json.loads(documentIds)
+            if isinstance(loaded_ids, list):
+                parsed_document_ids = [str(item) for item in loaded_ids]
+        except json.JSONDecodeError:
+            parsed_document_ids = [item.strip() for item in documentIds.split(",") if item.strip()]
+
     # 优先使用请求头里的 key/model（更安全），其次 query param，最后 fallback 到环境变量
     effective_api_key = x_ark_api_key or apiKey
     effective_model = x_ark_model or model
@@ -1372,6 +1952,7 @@ async def solve_stream(
             reasoningEffort,
             api_key=effective_api_key,
             model_name=effective_model,
+            document_ids=parsed_document_ids,
         ),
         media_type="text/event-stream",
         headers={
@@ -1402,6 +1983,7 @@ async def solve_stream_post(
             request.reasoningEffort,
             api_key=x_ark_api_key,
             model_name=x_ark_model,
+            document_ids=request.documentIds,
         ),
         media_type="text/event-stream",
         headers={
@@ -1416,19 +1998,20 @@ async def solve(request: SolveRequest):
     """执行推理（同步版本）"""
     execution_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now().isoformat()
+    model_question = build_question_with_documents(request.question, request.documentIds)
     
     # 动态规划子过程
-    subprocesses = await plan_subprocesses(request.question)
+    subprocesses = await plan_subprocesses(model_question)
     
     stages = []
-    current_output = request.question
+    current_output = model_question
     
     for subprocess in subprocesses:
         # 构建消息
         messages = [{"role": "system", "content": subprocess.get("system_prompt", "")}]
         user_template = subprocess.get("user_template", "问题：{question}\n\n已知：\n{previous_output}")
         user_content = user_template.format(
-            question=request.question,
+            question=model_question,
             previous_output=current_output
         )
         messages.append({"role": "user", "content": user_content})
@@ -1466,9 +2049,13 @@ async def solve(request: SolveRequest):
             "avgTimeMs": stats.get("avgTimeMs", 1000.0),
             "accuracy": round(accuracy, 3),
             "riskLevel": subprocess["risk_level"],
+            "riskScore": round(risk_level_to_score(subprocess["risk_level"]) * 100),
             "health": "green" if accuracy > 0.7 else "yellow" if accuracy > 0.5 else "red",
+            "healthScore": round(accuracy * 100),
             "order": subprocess["order"]
         })
+        stages[-1].update(diagnose_step(stages[-1], stages))
+        stages[-1] = apply_diagnosis_to_health(stages[-1])
         
         # 更新统计
         update_stats(subprocess["id"], time_ms, accuracy)
@@ -1476,10 +2063,15 @@ async def solve(request: SolveRequest):
         
         await asyncio.sleep(0.3)
     
+    stages = [apply_diagnosis_to_health(stage) for stage in attach_diagnosis(stages)]
+    trace_diagnosis = diagnose_trace(stages)
+
     # 更新当前会话
     CURRENT_SESSION.update({
         "question": request.question,
+        "documentIds": request.documentIds or [],
         "subprocesses": stages,
+        "traceDiagnosis": trace_diagnosis,
         "executionId": execution_id,
         "timestamp": timestamp
     })
@@ -1490,7 +2082,8 @@ async def solve(request: SolveRequest):
         "timestamp": timestamp,
         "question": request.question,
         "stages": stages,
-        "finalOutput": stages[-1]["output"] if stages else ""
+        "finalOutput": stages[-1]["output"] if stages else "",
+        "traceDiagnosis": trace_diagnosis
     })
     
     return {
@@ -1498,6 +2091,7 @@ async def solve(request: SolveRequest):
         "timestamp": timestamp,
         "question": request.question,
         "stages": stages,
+        "traceDiagnosis": trace_diagnosis,
         "finalOutput": stages[-1]["output"] if stages else ""
     }
 
@@ -1513,13 +2107,87 @@ async def get_history(limit: int = 20):
         "history": EXECUTION_HISTORY[-limit:] if len(EXECUTION_HISTORY) > limit else EXECUTION_HISTORY
     }
 
+@app.get("/api/research/template")
+async def get_research_case_template():
+    """返回研究级 failure case 模板。"""
+    return failure_case_template()
+
+
+@app.get("/api/research/cases")
+async def list_research_cases():
+    """列出当前进程内保存的研究 case。"""
+    cases = sorted(RESEARCH_CASES.values(), key=lambda item: item.get("createdAt", ""), reverse=True)
+    return {
+        "cases": [
+            {
+                "id": case.get("id"),
+                "title": case.get("title"),
+                "createdAt": case.get("createdAt"),
+                "caseType": case.get("caseType"),
+                "question": case.get("question"),
+                "observed_failure_types": case.get("observed_failure_types") or [],
+                "replayCount": len(case.get("replay_records") or []),
+                "stepCount": len(case.get("step_diagnosis") or []),
+            }
+            for case in cases
+        ]
+    }
+
+
+@app.get("/api/research/demo-cases")
+async def get_demo_research_cases():
+    """返回 3 个内置复现实验 case，不写入保存列表。"""
+    return {"cases": build_demo_research_cases()}
+
+
+@app.post("/api/research/demo-cases")
+async def save_demo_research_cases():
+    """把 3 个内置复现实验 case 保存到当前进程。"""
+    cases = build_demo_research_cases()
+    for case in cases:
+        RESEARCH_CASES[case["id"]] = case
+    return {"saved": len(cases), "cases": cases}
+
+
+@app.post("/api/research/cases")
+async def save_research_case(request: ResearchCaseSaveRequest):
+    """保存当前会话或前端传入的诊断快照为研究级 failure case。"""
+    case = build_research_case_from_payload(request)
+    if not case.get("question") and not case.get("step_diagnosis"):
+        raise HTTPException(status_code=400, detail="当前没有可保存的会话，请先运行一次问题或传入 subprocesses。")
+    RESEARCH_CASES[case["id"]] = case
+    return {"case": case, "report": render_case_report(case)}
+
+
+@app.get("/api/research/cases/{case_id}")
+async def get_research_case(case_id: str):
+    case = RESEARCH_CASES.get(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Research case not found")
+    return {"case": case}
+
+
+@app.get("/api/research/cases/{case_id}/report", response_class=PlainTextResponse)
+async def export_research_case_report(case_id: str):
+    case = RESEARCH_CASES.get(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Research case not found")
+    return PlainTextResponse(
+        render_case_report(case),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{case_id}.md"'},
+    )
+
 @app.post("/api/rerun")
 async def rerun():
     """重跑当前会话"""
     if not CURRENT_SESSION.get("question"):
         return {"message": "当前没有会话，请先输入问题"}
     
-    return await solve(SolveRequest(question=CURRENT_SESSION["question"]))
+    return await solve(SolveRequest(
+        question=CURRENT_SESSION["question"],
+        documentIds=CURRENT_SESSION.get("documentIds") or []
+    ))
 
 @app.get("/api/rerun/stream")
 async def rerun_stream():
@@ -1528,7 +2196,10 @@ async def rerun_stream():
         raise HTTPException(status_code=400, detail="当前没有会话，请先输入问题")
     
     return StreamingResponse(
-        generate_solve_events(CURRENT_SESSION["question"]),
+        generate_solve_events(
+            CURRENT_SESSION["question"],
+            document_ids=CURRENT_SESSION.get("documentIds") or []
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

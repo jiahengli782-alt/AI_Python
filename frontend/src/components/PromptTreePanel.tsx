@@ -424,6 +424,56 @@ export function PromptTreePanel({
     return labels[relation] || relation;
   };
 
+  const buildProvenanceNodeDetail = (
+    step: Subprocess,
+    node: ProvenanceNode,
+    graph: { nodes: ProvenanceNode[]; edges: ProvenanceEdge[] }
+  ) => {
+    const relatedEdges = graph.edges.filter(edge => edge.source === node.id || edge.target === node.id);
+    const edgeBlocks = relatedEdges.map((edge, index) => [
+      `${index + 1}. ${edgeLabel(edge.relation)}`,
+      `from: ${edge.source}`,
+      `to: ${edge.target}`,
+      edge.status ? `status: ${edge.status}` : '',
+      edge.evidence ? `完整证据:\n${edge.evidence}` : '',
+    ].filter(Boolean).join('\n')).join('\n\n');
+
+    return [
+      `【节点类型】\n${sourceTypeLabel(node.type)}`,
+      `【节点标题】\n${node.label}`,
+      node.status ? `【节点状态】\n${node.status}` : '',
+      `【节点完整内容】\n${node.detail || '暂无节点详情'}`,
+      edgeBlocks ? `【与该节点相关的信息流向】\n${edgeBlocks}` : '',
+      step.evidence_source ? `【当前 Step 的完整错误/证据源】\n${step.evidence_source}` : '',
+      step.output ? `【当前 Step 输出】\n${step.output}` : '',
+      step.input ? `【当前 Step 输入】\n${step.input}` : '',
+    ].filter(Boolean).join('\n\n');
+  };
+
+  const renderExpandedDetailContent = (content: string) => {
+    const lines = (content || '').split('\n');
+    return (
+      <div className="min-h-0 flex-1 overflow-auto px-5 py-4 font-sans text-base leading-8 text-slate-700">
+        {lines.map((line, index) => {
+          const headingMatch = line.trim().match(/^【(.+)】$/);
+          if (headingMatch) {
+            return (
+              <div key={index} className={clsx(index > 0 && 'mt-5', 'text-lg font-bold text-red-600')}>
+                {line}
+              </div>
+            );
+          }
+          if (!line.trim()) return <div key={index} className="h-3" />;
+          return (
+            <div key={index} className="whitespace-pre-wrap break-words text-base leading-8 text-slate-700">
+              {line}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   const renderProvenanceView = () => (
     <div className="min-w-[620px] space-y-3">
       {subprocesses.map((step) => {
@@ -568,7 +618,7 @@ export function PromptTreePanel({
     const stepNode = `step:${step.order}`;
     const logPattern = /(API调用失败|SetLimitExceeded|quota|429|401|403|404|exception|traceback|failed|error|错误码|报错|调用失败)/i;
     const documentPattern = /(已上传文档|片段\s*\d+|文件名|来源|引用|\.pdf|\.docx|\.csv|\.txt|网上搜索|检索结果|网页|资料)/i;
-    const shortEvidence = (text?: string) => compactText(text || '', 110);
+    const fullEvidence = (text?: string) => (text || '').trim();
     const addNode = (node: ProvenanceNode) => {
       if (!nodes.some(item => item.id === node.id)) nodes.push(node);
     };
@@ -597,8 +647,8 @@ export function PromptTreePanel({
       const detail = type === 'log'
         ? (logPattern.test(step.evidence_source || '') ? step.evidence_source : '')
         : type === 'tool'
-          ? shortEvidence(step.output || step.input)
-          : shortEvidence(documentPattern.test(step.output || '') ? step.output : step.input || step.output);
+          ? fullEvidence(step.output || step.input)
+          : fullEvidence(documentPattern.test(step.output || '') ? step.output : step.input || step.output);
       addNode({ id, type, label: type === 'document' ? `外部资料/检索来源：${ref}` : ref, detail });
       addEdge({ source: id, target: stepNode, relation: type === 'tool' ? 'tool_result_used' : 'document_evidence_used', evidence: step.evidence_source });
     });
@@ -665,7 +715,7 @@ export function PromptTreePanel({
               </svg>
 
               {sourceNodes.map((node, idx) => (
-                <button key={node.id} onClick={() => setResultDetail({ title: `${sourceTypeLabel(node.type)}：${node.label}`, content: node.detail || '暂无详情' })} className={clsx('absolute left-5 w-[205px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', visualNodeTone(node.type, node.status))} style={{ top: sourceY(idx) }} title={node.detail || node.label}>
+                <button key={node.id} onClick={() => setResultDetail({ title: `${sourceTypeLabel(node.type)}：${node.label}`, content: buildProvenanceNodeDetail(step, node, graph) })} className={clsx('absolute left-5 w-[205px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', visualNodeTone(node.type, node.status))} style={{ top: sourceY(idx) }} title={node.detail || node.label}>
                   <div className="font-semibold">{sourceTypeLabel(node.type)}</div>
                   <div className="mt-0.5 truncate">{node.label}</div>
                 </button>
@@ -678,7 +728,7 @@ export function PromptTreePanel({
               </button>
 
               {downstreamNodes.map((node, idx) => (
-                <button key={node.id} onClick={() => { const target = subprocesses[Number(node.id.split(':')[1]) - 1]; if (target) openCurrentStep(target); }} className={clsx('absolute left-[670px] w-[205px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', visualNodeTone(node.type, node.status))} style={{ top: downstreamY(idx) }} title={node.detail || node.label}>
+                <button key={node.id} onClick={() => setResultDetail({ title: `${sourceTypeLabel(node.type)}：${node.label}`, content: buildProvenanceNodeDetail(step, node, graph) })} className={clsx('absolute left-[670px] w-[205px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', visualNodeTone(node.type, node.status))} style={{ top: downstreamY(idx) }} title={node.detail || node.label}>
                   <div className="font-semibold">下游使用</div>
                   <div className="mt-0.5 truncate">{node.label}</div>
                 </button>
@@ -1179,13 +1229,13 @@ export function PromptTreePanel({
 
       {isDetailExpanded && (resultDetail || editingTarget) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 px-6 py-8">
-          <div className="flex max-h-full w-full max-w-5xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl">
+          <div className="flex max-h-full min-h-0 w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div>
-                <div className="text-sm font-semibold text-slate-800">
+                <div className={clsx('font-bold', editingTarget ? 'text-base text-slate-800' : 'text-xl text-red-600')}>
                   {editingTarget ? `${editorTitle}（修复 Prompt 放大编辑）` : resultDetail?.title}
                 </div>
-                <div className="mt-0.5 text-[11px] text-slate-400">
+                <div className={clsx('mt-1 font-semibold', editingTarget ? 'text-[11px] text-slate-400' : 'text-sm text-red-500')}>
                   {editingTarget ? '主要修改 User Prompt 输入模板；确认后点试运行 / 采纳' : '完整内容，可滚动查看'}
                 </div>
               </div>
@@ -1240,9 +1290,7 @@ export function PromptTreePanel({
               </div>
             ) : (
               resultDetail && (
-                <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap px-5 py-4 text-sm leading-7 text-slate-700 font-sans">
-                  {resultDetail.content}
-                </pre>
+                renderExpandedDetailContent(resultDetail.content)
               )
             )}
           </div>

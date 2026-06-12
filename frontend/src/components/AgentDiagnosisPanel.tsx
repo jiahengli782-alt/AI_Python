@@ -193,6 +193,24 @@ const block = (title: string, value?: string, max = 900) => {
   return clean ? `【${title}】\n${compactLine(clean, max)}` : '';
 };
 
+const extractContentFocus = (step: DiagnosisStep, currentQuestion?: string) => {
+  const source = [
+    currentQuestion,
+    step.input,
+    step.output,
+    step.evidence_source,
+    ...(step.diagnosis_evidence || []),
+    ...(step.potential_risks || []).map(risk => risk.source_excerpt || risk.reason || ''),
+  ].filter(Boolean).join('\n');
+  const snippets = source
+    .split(/[\n。！？!?；;]+/)
+    .map(item => item.replace(/\s+/g, ' ').trim())
+    .filter(item => item.length >= 8)
+    .filter(item => !/when|where|why|how/i.test(item))
+    .slice(0, 5);
+  return snippets.length ? snippets : [compactLine(source, 220)].filter(Boolean);
+};
+
 const fixCategoryOf = (fix: string) => {
   if (/System Prompt/i.test(fix)) return 'System Prompt';
   if (/User Template/i.test(fix)) return 'User Template';
@@ -258,9 +276,9 @@ const buildOutputContract = (step: DiagnosisStep, labels: string[]) => {
       'next_step_input：后续步骤必须继承的证据和结论',
     ];
   }
-  if (hasAnyText(joined, ['约束', '验证', 'when', 'where', 'why', 'how'])) {
+  if (hasAnyText(joined, ['约束', '验证', '检查', '标准'])) {
     return [
-      'checks：逐条列出 when、where、why、how 或用户显式约束',
+      'checks：逐条列出用户原文中的显式约束、业务对象、状态判断和验收标准',
       'evidence：每条检查对应的原文/日志/上游依据',
       'pass：true/false，不能用模糊词代替',
       'failed_reason：未通过时写清楚缺什么输入',
@@ -304,7 +322,7 @@ const buildStageSystemRules = (step: DiagnosisStep, labels: string[]) => {
     return [
       ...common,
       '规划时必须把用户问题拆成可验证检查点，每个检查点写清需要什么证据、交给哪个后续步骤使用。',
-      '如果用户要求 when/where/why/how、引用、文档或日志定位，必须分别列为独立检查点。',
+      '如果原文涉及引用、文档、日志定位、状态判断、数量或时间，必须分别列为独立检查点。',
       '输出必须包含 next_step_input，供后续步骤直接使用。',
     ];
   }
@@ -359,101 +377,206 @@ const buildUserPromptRewrite = (
     ...(step.potential_risks || []).map(risk => risk.label || risk.failure_type),
   ].filter(Boolean).join('、');
   const sourceText = step.evidence_source || step.diagnosis_evidence?.join('\n') || step.output || step.input || '';
-  const requiredInputPatch = (() => {
+  const contentFocus = extractContentFocus(step, currentQuestion);
+  const refinedPrompt = [
+    `请重新执行 Step ${step.order}「${step.name}」，只围绕下面这些原文焦点补强，不要把诊断维度当成用户任务：`,
+    ...contentFocus.map((item, index) => `${index + 1}. ${item}`),
+    '输出时必须保留和这些原文焦点直接相关的实体、状态、数量、时间、证据来源和上游结论；如果缺少依据，明确写“证据不足”。',
+  ];
+  const naturalFix = (() => {
     if (/context_omission|上下文|遗漏|过长|继承/.test(labels + sourceText)) {
       return [
-        '【强制补入输入】',
-        '把上游已经出现但本步骤遗漏的信息原样放进 step_input，不允许只写“信息不足”。',
-        '必须新增字段：carried_over_facts、missing_items、source_step、next_step_input。',
-        block('carried_over_facts', sourceText || step.output || step.input, 1200),
+        '这一步的问题更像是上游信息没有被完整带入。请先回看下面的上游输出和原文焦点，把其中已经出现的关键实体、状态、数量、时间、约束和证据来源原样带入本步骤，再继续生成结果。',
+        '如果某个关键信息在上游已经出现，不要再回答“信息不足”；只有在上游和原始问题里都没有依据时，才写“证据不足”。',
+        '生成结果时请明确说明哪些信息被继承使用，哪些信息仍然缺失，最后给出能直接交给下一步使用的简洁结论。',
       ];
     }
     if (/retrieval_miss|证据|检索|来源|引用/.test(labels + sourceText)) {
       return [
-        '【强制补入输入】',
-        '把用户问题中的关键实体、时间、状态、功能名、错误码拆成 retrieval_query，不允许泛泛检索。',
-        '必须新增字段：retrieval_query、matched_evidence、missing_evidence、source_refs。',
-        block('retrieval_query_basis', `${currentQuestion || ''}\n${step.input || ''}`, 1200),
+        '这一步的问题更像是证据不足或证据方向没有覆盖原问题。请根据原始问题和上游输入，先明确要找的对象、状态、时间、功能名、错误码或关键结论，再围绕这些内容补充证据。',
+        '不要泛泛总结资料；每个事实性结论都必须说明来自哪段输入、哪份文档、哪条日志或哪个上游输出。如果找不到能支撑结论的依据，请直接写“证据不足”，不要补造结论。',
+        '生成结果时请把“已找到的证据”和“仍缺少的证据”分开说清楚。',
       ];
     }
     if (/tool_misuse|API|工具|调用|日志|错误码|SetLimitExceeded|429/i.test(labels + sourceText)) {
       return [
-        '【强制补入输入】',
-        '把接口名、请求参数、错误码、错误消息、是否可重试作为本步骤输入，不允许继续推业务结论。',
-        '必须新增字段：tool_name、request_args、error_code、error_message、retryable、next_action。',
-        block('runtime_error_source', sourceText, 1200),
+        '这一步的问题来自工具、API 或日志错误。请先定位错误码、接口名、请求参数和错误消息，再判断是否能继续推理。',
+        '如果 API/工具调用已经失败，不要继续生成业务结论；请只说明失败边界、可能原因、是否可重试，以及下一步应该补充或修正什么输入。',
+        '如果日志中有明确错误文本，请优先引用该错误文本作为依据。',
       ];
     }
     if (/unsupported_claim|fact_error|幻觉|事实|无证据|状态|上线/.test(labels + sourceText)) {
       return [
-        '【强制补入输入】',
-        '把每个结论拆成 claim，并强制为每个 claim 填 evidence_source；没有来源的 claim 必须移入 uncertainty。',
-        '必须新增字段：claims、evidence_source、unsupported_claims、uncertainty。',
-        block('claim_check_basis', `${step.output || ''}\n${sourceText}`, 1200),
+        '这一步的问题更像是结论没有被证据支撑，或事实/状态判断可能写得过满。请重新检查本步骤中的每个事实性结论，只保留能从原始问题、上游输出、文档片段或日志文本中找到依据的内容。',
+        '对于没有依据的结论，不要写成确定事实；请改写为“不确定”或“证据不足”。对于有依据的结论，请在句子里自然说明依据来自哪里。',
+        '尤其注意数字、时间、状态、是否上线、是否完成、功能是否具备这类结论，必须逐项核对来源。',
       ];
     }
     if (/planning_error|规划|检查项|约束/.test(labels + sourceText)) {
       return [
-        '【强制补入输入】',
-        '把用户目标拆成可验收检查项，每个检查项必须写清需要的证据、交给哪个后续 step 使用。',
-        '必须新增字段：checks、required_evidence、where_to_step、acceptance_criteria。',
-        block('planning_basis', currentQuestion || step.input || sourceText, 1200),
+        '这一步的问题更像是任务拆解不够贴合原问题。请重新围绕原始问题中的对象、目标、限制条件、需要核对的资料和最终交付要求来规划。',
+        '不要只写泛泛步骤；每个子任务都要说明它要核对什么原文内容、需要什么证据，以及它的结果会交给后面哪类步骤使用。',
+        '如果原问题里有必须满足的条件，请把这些条件保留下来，避免后续步骤默认已经覆盖。',
       ];
     }
     return [
-      '【强制补入输入】',
-      '把原始问题、上游输出、证据源和诊断原因都作为本步骤输入，不允许仅凭当前短摘要继续推理。',
-      '必须新增字段：original_question、upstream_output、evidence_source、diagnosis_reason、next_step_input。',
+      '请根据下面的原始问题、上游输出和错误触发文本重新执行这一步。不要只根据当前短摘要继续推理。',
+      '生成时优先保留原文中的关键对象、约束、证据来源和上游结论；遇到没有依据的内容，请明确写“证据不足”。',
+      '最后输出一段能被后续步骤直接使用的结果。',
     ];
   })();
-  const additions = [
-    'original_question：原始用户问题，必须完整保留',
-    'step_input：本步骤原始输入或上游传入内容',
-    'previous_step_output：上一版本步骤输出，用于定位遗漏、矛盾或无证据结论',
-    'diagnosis_reason：为什么需要重跑这个步骤',
-    'priority_evidence_source：必须优先核对的文字源头/日志/文档片段',
-    'required_checks：本次必须补齐的检查项',
-    'output_contract：本步骤必须输出给后续的结构化字段',
-  ];
+  const usefulFixes = fixes
+    .map(fix => cleanFixText(fix.text))
+    .filter(Boolean)
+    .slice(0, 3);
   return [
-    '请把本步骤 User Prompt / 输入模板改成以下结构。重点是把缺失的上游信息/证据/日志强制放进输入，而不是写修改建议：',
+    `请重新执行 Step ${step.order}「${step.name}」。下面是根据当前真实错误原因生成的修复版自然语言 Prompt：`,
     '',
-    ...requiredInputPatch,
+    ...refinedPrompt,
     '',
-    ...additions.map((item, index) => `${index + 1}. ${item}`),
+    ...naturalFix,
     '',
-    block('original_question', currentQuestion, 1400),
-    block('step_input', step.input, 1400),
-    block('previous_step_output', step.output, 1400),
-    step.failure_reason ? block('diagnosis_reason', step.failure_reason, 1200) : '',
-    step.evidence_source ? block('priority_evidence_source', step.evidence_source, 900) : '',
-    step.evidence_strength_basis?.length ? `【diagnosis_signals】\n${step.evidence_strength_basis.join('\n')}` : '',
+    usefulFixes.length ? '可以参考这些具体修复方向，但不要把它们原样当成回答内容：' : '',
+    ...usefulFixes.map((item, index) => `${index + 1}. ${item}`),
     '',
-    '【required_checks】',
-    ...fixes.map((fix, index) => `${index + 1}. ${fix.category}：${fix.text}`),
+    block('原始问题', currentQuestion, 1400),
+    block('本步骤当前输入或上游传入内容', step.input, 1400),
+    block('本步骤上一版输出', step.output, 1400),
+    step.failure_reason ? block('为什么需要改这一处', step.failure_reason, 1200) : '',
+    step.evidence_source ? block('优先核对的原文/日志/证据片段', step.evidence_source, 900) : '',
+    '',
+    '请直接给出修复后的本步骤结果，不要解释你如何修改 Prompt。',
   ].filter(Boolean);
 };
 
 const buildFixPreviewPrompt = (
   step: DiagnosisStep,
-  fixes: { category: string; text: string }[],
+  _fixes: { category: string; text: string }[],
   labels: string[],
   currentQuestion?: string,
 ) => {
-  const outputContract = buildOutputContract(step, labels);
-  const systemRules = buildStageSystemRules(step, labels);
-  const userRewrite = buildUserPromptRewrite(step, fixes, currentQuestion);
+  const clean = (value?: string) => (value || '').replace(/\s+/g, ' ').trim();
+  const question = clean(currentQuestion);
+  const isOriginalQuestion = (value?: string) => {
+    const text = clean(value);
+    if (!text || !question) return false;
+    const head = question.slice(0, 42);
+    return text === question || (head.length >= 12 && text.includes(head));
+  };
+
+  const splitSentences = (value?: string) =>
+    clean(value)
+      .split(/(?<=[。！？!?；;])|\n+/)
+      .map(clean)
+      .filter(item => item.length >= 8)
+      .filter(item => !isOriginalQuestion(item))
+      .filter(item => !/^API调用失败/.test(item));
+
+  const shortNatural = (value?: string, max = 360) => {
+    const text = clean(value);
+    if (!text) return '';
+    if (text.length <= max) return text;
+    const sentence = splitSentences(text).find(item => item.length <= max);
+    if (sentence) return sentence;
+    const cut = text.slice(0, max);
+    const lastBreak = Math.max(
+      cut.lastIndexOf('。'),
+      cut.lastIndexOf('；'),
+      cut.lastIndexOf('，'),
+      cut.lastIndexOf(';'),
+      cut.lastIndexOf(',')
+    );
+    return cut.slice(0, lastBreak > 80 ? lastBreak : max).trim();
+  };
+
+  const pickStepTarget = () => {
+    const candidates = [
+      step.input,
+      step.output,
+      step.evidence_source,
+      step.failure_reason,
+      step.potential_risks?.[0]?.source_excerpt,
+      step.potential_risks?.[0]?.reason,
+      step.name,
+    ];
+    for (const candidate of candidates) {
+      const sentence = splitSentences(candidate).find(item => item.length >= 8);
+      if (sentence) return shortNatural(sentence, 320);
+      const cleaned = clean(candidate);
+      if (cleaned && !isOriginalQuestion(cleaned)) return shortNatural(cleaned, 320);
+    }
+    return step.name;
+  };
+
+  const extractMissing = () => {
+    const text = clean([
+      step.failure_reason,
+      step.evidence_source,
+      step.potential_risks?.[0]?.reason_summary,
+      step.potential_risks?.[0]?.reason,
+      step.potential_risks?.[0]?.source_excerpt,
+    ].filter(Boolean).join(' '));
+    const patterns = [
+      /缺少[：:]?\s*([^。；\n]{2,160})/,
+      /(?:丢失|遗漏|没有带入|未保留|未覆盖)(?:了|的)?[“"']?([^。；\n]{2,160})/,
+      /(?:调用错|误用|调用失败|错误码|接口失败)[：: ]?([^。；\n]{2,160})/,
+      /(?:约束|限制|要求)(?:不足|不够|缺少|未覆盖)[：: ]?([^。；\n]{2,160})/,
+    ];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match?.[1]) return shortNatural(match[1], 220);
+    }
+    return '';
+  };
+
+  const previousEvidence = shortNatural(
+    step.evidence_source ||
+    step.diagnosis_evidence?.join('\n') ||
+    step.potential_risks?.[0]?.source_excerpt ||
+    '',
+    420
+  );
+  const typeText = `${labels.join(' ')} ${step.failure_type || ''} ${step.failure_label || ''} ${step.failure_reason || ''} ${step.potential_risks?.[0]?.failure_type || ''}`;
+  const target = pickStepTarget();
+  const missing = extractMissing();
+
+  const instruction = (() => {
+    if (/context_omission|上下文|遗漏|丢失|继承/.test(typeText)) {
+      return missing
+        ? `执行“${step.name}”时，先继续保留上游已经得到的关键信息：${missing}。不要把这些已有信息误判为缺失；如果需要筛选，请说明筛选依据，再基于“${target}”继续推理。`
+        : `执行“${step.name}”时，先完整继承上游输出里的关键对象、状态、约束和证据。不要只看当前摘要；如果某个信息没有被继续使用，请说明为什么舍弃，再基于“${target}”继续推理。`;
+    }
+    if (/retrieval_miss|证据|检索|来源|引用|无证据/.test(typeText)) {
+      return missing
+        ? `执行“${step.name}”时，先补齐能支持“${missing}”的具体证据来源。找不到来源就写“证据不足”，不要把推测写成结论。`
+        : `执行“${step.name}”时，先围绕“${target}”补具体证据来源。每个事实结论都要能对应到上游输出、文档片段、日志或工具结果；找不到就写“证据不足”。`;
+    }
+    if (/tool_misuse|API|工具|调用|日志|错误码|SetLimitExceeded|429/i.test(typeText)) {
+      return `执行“${step.name}”时，先核对工具/API 的接口、参数和返回错误。若日志里已经出现“${shortNatural(step.evidence_source || target, 220)}”，不要继续生成业务结论，只说明调用失败边界、需要重试或需要补充的输入。`;
+    }
+    if (/constraint_violation|约束|限制|必须|不能|不要/.test(typeText)) {
+      return missing
+        ? `执行“${step.name}”时，把“${missing}”写成必须遵守的硬约束。输出前逐条检查这些约束，不满足就改写或标记为证据不足。`
+        : `执行“${step.name}”时，把“${target}”里的限制条件转成明确检查项。输出前逐条核对，不满足就不要放行。`;
+    }
+    if (/unsupported_claim|fact_error|hallucination|事实|幻觉|状态|上线/.test(typeText)) {
+      return `执行“${step.name}”时，只把有来源支持的内容写成确定结论。围绕“${target}”逐条核对来源；数字、时间、状态、是否完成、是否上线这类判断没有证据就写“证据不足”。`;
+    }
+    if (/planning_error|规划|检查项/.test(typeText)) {
+      return `执行“${step.name}”时，把下一步推理目标拆清楚：围绕“${target}”列出要核对的对象、需要的证据、限制条件和交给后续步骤使用的结果，不要只写泛泛计划。`;
+    }
+    return `执行“${step.name}”时，围绕“${target}”补上缺失信息和必要限制。没有来源支持的内容写“证据不足”，不要扩展无关任务。`;
+  })();
+
   return [
-    `【同步System Prompt】`,
-    ...systemRules,
-    '',
-    `【同步User Prompt输入模板】`,
-    ...userRewrite,
-    '',
-    '【输出字段要求】',
-    ...outputContract.map((item, index) => `${index + 1}. ${item}`),
+    instruction,
+    previousEvidence ? `需要重点核对的错误源头：${previousEvidence}` : '',
   ].filter(Boolean).join('\n');
 };
+
+void buildOutputContract;
+void buildStageSystemRules;
+void buildUserPromptRewrite;
 
 const mergeFixItems = (items: string[]) => {
   const groups = new Map<string, string[]>();
@@ -506,6 +629,12 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
   const contentFailures = orderedSteps.filter(isContentFailure);
   const weakWarnings = orderedSteps.filter(isSoftHint);
   const potentialRiskSteps = orderedSteps.filter(step => step.potential_risks?.length);
+  const isFailureSourceStep = (step: DiagnosisStep) =>
+    isContentFailure(step) &&
+    !contentFailures.some(prev =>
+      (prev.order || 0) < (step.order || 0) &&
+      (prev.affected_steps || []).includes(step.order)
+    );
   const diagnosis = traceDiagnosis || buildFallbackDiagnosis(orderedSteps);
   const firstFailure = contentFailures[0] || null;
   const status = statusMeta[firstFailure ? 'failure' : weakWarnings.length ? 'partial_failure' : 'success'];
@@ -516,15 +645,12 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
     arr.findIndex(item => item.from_step === edge.from_step && item.to_step === edge.to_step) === index
   );
   const fixGroups = orderedSteps.map((step, index) => {
+    const isSource = isFailureSourceStep(step);
     const rawItems = Array.from(new Set([
-      ...(isContentFailure(step) ? (step.suggested_fix || []) : []),
-      ...(step.potential_risks || []).flatMap(risk => risk.suggested_fixes || (risk.suggested_fix ? [risk.suggested_fix] : [])),
-      ...(isSoftHint(step) ? (step.suggested_fix || []) : []),
+      ...(isSource ? (step.suggested_fix || []) : []),
     ].filter(Boolean)));
     const labels = Array.from(new Set([
-      ...(isContentFailure(step) ? [labelOf(step)] : []),
-      ...(step.potential_issue_tags || []),
-      ...(isSoftHint(step) ? [labelOf(step)] : []),
+      ...(isSource ? [labelOf(step)] : []),
     ].filter(Boolean)));
     return { step, fixes: mergeFixItems(rawItems), labels, palette: stepPalettes[index % stepPalettes.length] };
   }).filter(group => group.fixes.length > 0);
@@ -835,6 +961,14 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
                     )}
                   </div>
                 </div>
+                <div className="mt-2 rounded-md bg-white/70 px-2 py-1.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-100">
+                  错误源头：建议改 Step {group.step.order}
+                  {group.step.affected_steps?.length
+                    ? `，该错误会继续影响 Step ${group.step.affected_steps.join('、Step ')}`
+                    : group.step.where_to_steps?.length
+                      ? `，它的输出会进入 Step ${group.step.where_to_steps.join('、Step ')}`
+                      : '，这是当前可定位到的直接错误位置'}
+                </div>
                 <div className="mt-2 space-y-2">
                   {group.fixes.map((fix) => (
                     <div key={fix.category} className={clsx('rounded-md px-3 py-2 text-xs leading-5 text-slate-700 ring-1', group.palette.item)}>
@@ -845,7 +979,7 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
               </div>
             )) : (
               <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
-                没有明确内容错误证据，因此暂不建议修改 Prompt。可以继续观察输出，或手动选择某个 step 做反事实试运行。
+                没有明确内容错误源头，因此暂不生成自动修复建议。可以继续观察输出，或手动选择某个 step 做反事实试运行。
               </div>
             )}
             {weakWarnings.length > 0 && contentFailures.length === 0 && (

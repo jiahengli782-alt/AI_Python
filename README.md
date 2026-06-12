@@ -380,3 +380,14 @@ npm run dev
 ## 协议
 
 MIT License — 随便用
+# ST-TraceAgent：AI Agent 时空可解释错误诊断系统
+
+这是一个面向 LLM Agent 开发者的错误诊断与可解释分析工具。它保留原有 AI 动态推理可视化、Prompt 修改重算、目标-子过程树和版本历史能力，并新增 When / Where / How 诊断视角：
+
+- When：定位失败发生在哪个步骤、哪个执行阶段。
+- Where：分析信息来源、证据丢失位置和错误传播到哪些后续步骤。
+- How：给出失败类型、判断证据、置信度和可执行修复建议。
+- Replay：复用现有 Prompt Patch 重算能力，支持反事实重放对比。
+- Auto-Tuning：根据失败类型生成修复建议，辅助用户优化 Prompt、上下文和验证策略。
+
+> 当前版本优先实现最小可用诊断链路：后端为每个 step 追加诊断字段，前端展示任务总览、When/Where/How/Replay/Auto-Tuning 面板。

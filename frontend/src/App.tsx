@@ -5,6 +5,7 @@ import { PromptTreePanel, type TreePreviewResult, type TreePromptOpenRequest } f
 import { ChatHistoryPanel, type ConversationSnapshot } from './components/ChatHistoryPanel';
 import { SettingsModal, loadSettings, saveSettings, type UserSettings } from './components/SettingsModal';
 import { AgentDiagnosisPanel, type AgentTraceDiagnosis, type AgentStageType, type AgentFailureType, type ProvenanceEdge, type ProvenanceNode } from './components/AgentDiagnosisPanel';
+import { ResearchCasePanel } from './components/ResearchCasePanel';
 
 const CONVERSATIONS_STORAGE_KEY = 'agent_conversations_v1';
 const ACTIVE_CONVERSATION_STORAGE_KEY = 'agent_active_conversation_v1';
@@ -448,6 +449,7 @@ export default function App() {
   const [replayHistory, setReplayHistory] = useState<ReplayRecord[]>([]);
   const [isReplayCollapsed, setIsReplayCollapsed] = useState(false);
   const [replayDetail, setReplayDetail] = useState<{ title: string; content: string } | null>(null);
+  const [showResearchCasePanel, setShowResearchCasePanel] = useState(false);
   const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([]);
   const [isUploadingDocument, setIsUploadingDocument] = useState(false);
   const [isDraggingDocument, setIsDraggingDocument] = useState(false);
@@ -1393,7 +1395,7 @@ export default function App() {
         }]);
 
         setModificationHistory(prev => [...prev, {
-          round: prev.length + 1,
+          round: (prev.reduce((max, item) => Math.max(max, item.round || 0), 0) || 0) + 1,
           modifiedStepIndex: modifiedStepIndex ?? -1,
           stages: completedStages,
           traceDiagnosis: data.traceDiagnosis || data.trace_diagnosis || null,
@@ -1517,6 +1519,16 @@ export default function App() {
     setIsLoading(true);
     setError(null);
     setRerunFromStep(stepIndex);
+    setModificationHistory(prev => {
+      if (prev.length > 0 || !commitBaseStages.length) return prev;
+      return [{
+        round: 1,
+        modifiedStepIndex: -1,
+        stages: commitBaseStages.map(stage => ({ ...stage })),
+        traceDiagnosis,
+        timestamp: Date.now(),
+      }];
+    });
 
     try {
       const modifiedOutputs: Record<string, string> = {};
@@ -2108,7 +2120,7 @@ export default function App() {
             {/* 修改历史 - 与上面统一为 rounded-xl + 一致标题栏 */}
             <div className="flex-1 min-h-0">
               <div className="h-full bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
-                <div className="px-4 py-3 border-b border-slate-200 flex-shrink-0">
+                <div className="px-4 py-3 border-b border-slate-200 flex-shrink-0 flex items-center justify-between gap-2">
                   <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z" />
@@ -2120,6 +2132,13 @@ export default function App() {
                       </span>
                     )}
                   </h3>
+                  <button
+                    type="button"
+                    onClick={() => setShowResearchCasePanel(true)}
+                    className="rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-100"
+                  >
+                    研究 Case
+                  </button>
                 </div>
                 <div className="flex-1 min-h-0 flex flex-col">
                   <div className="flex-1 min-h-[120px]">
@@ -2583,6 +2602,28 @@ export default function App() {
             <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap break-words px-5 py-4 font-sans text-sm leading-7 text-slate-700">
               {replayDetail.content}
             </pre>
+          </div>
+        </div>
+      )}
+
+      {showResearchCasePanel && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 px-6 py-8"
+          onClick={() => setShowResearchCasePanel(false)}
+        >
+          <div
+            className="max-h-full w-full max-w-4xl overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <ResearchCasePanel
+              settings={settings}
+              question={activeQuestion || chatMessages.find(m => m.role === 'user')?.content || question}
+              subprocesses={subprocesses}
+              traceDiagnosis={traceDiagnosis}
+              replayHistory={replayHistory}
+              uploadedDocuments={uploadedDocuments}
+              onClose={() => setShowResearchCasePanel(false)}
+            />
           </div>
         </div>
       )}

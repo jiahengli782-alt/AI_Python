@@ -57,15 +57,21 @@ export function ModificationFlow({
   useEffect(() => {
     const updateDimensions = () => {
       if (containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
         setDimensions({
-          width: containerRef.current.clientWidth,
-          height: containerRef.current.clientHeight,
+          width: Math.max(320, Math.floor(rect.width)),
+          height: Math.max(180, Math.floor(rect.height)),
         });
       }
     };
     updateDimensions();
+    const observer = new ResizeObserver(updateDimensions);
+    if (containerRef.current) observer.observe(containerRef.current);
     window.addEventListener('resize', updateDimensions);
-    return () => window.removeEventListener('resize', updateDimensions);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updateDimensions);
+    };
   }, []);
 
   const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -106,17 +112,20 @@ export function ModificationFlow({
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    if (dimensions.width <= 0 || dimensions.height <= 0) return;
 
     const dpr = window.devicePixelRatio || 1;
     canvas.width = dimensions.width * dpr;
     canvas.height = dimensions.height * dpr;
+    canvas.style.width = `${dimensions.width}px`;
+    canvas.style.height = `${dimensions.height}px`;
     ctx.scale(dpr, dpr);
 
     ctx.clearRect(0, 0, dimensions.width, dimensions.height);
 
     if (modificationHistory.length === 0) return;
 
-    const margin = { top: 25, right: 20, bottom: 35, left: 35 };
+    const margin = { top: 28, right: 28, bottom: 48, left: 58 };
     const plotWidth = dimensions.width - margin.left - margin.right;
     const plotHeight = dimensions.height - margin.top - margin.bottom;
 
@@ -142,7 +151,7 @@ export function ModificationFlow({
     const points: { x: number; y: number; stepIndex: number }[] = [];
     for (let i = 0; i < n; i++) {
       const record = modificationHistory[i];
-      const x = margin.left + i * xStep;
+      const x = n === 1 ? margin.left + plotWidth / 2 : margin.left + i * xStep;
       const y = getY(record.modifiedStepIndex + 1);
       points.push({ x, y, stepIndex: record.modifiedStepIndex + 1 });
     }
@@ -222,7 +231,7 @@ export function ModificationFlow({
 
       ctx.fillStyle = '#64748b';
       ctx.font = '10px system-ui, sans-serif';
-      ctx.fillText(stepVal === 0 ? '基线' : `${stepVal}`, margin.left - 6, y);
+      ctx.fillText(stepVal === 0 ? '基线' : `${stepVal}`, margin.left - 10, y);
     }
 
     // Y轴标签
@@ -231,7 +240,7 @@ export function ModificationFlow({
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.save();
-    ctx.translate(12, margin.top + plotHeight / 2);
+    ctx.translate(18, margin.top + plotHeight / 2);
     ctx.rotate(-Math.PI / 2);
     ctx.fillText('步骤', 0, 0);
     ctx.restore();
@@ -251,7 +260,7 @@ export function ModificationFlow({
     ctx.font = 'bold 11px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
-    ctx.fillText('版本 Round', margin.left + plotWidth / 2, dimensions.height - 8);
+    ctx.fillText('版本 Round', margin.left + plotWidth / 2, dimensions.height - 18);
 
     // Y轴线
     ctx.strokeStyle = '#e2e8f0';
@@ -297,10 +306,10 @@ export function ModificationFlow({
   }, [modificationHistory, dimensions, hoveredPoint]);
 
   return (
-    <div ref={containerRef} className="h-full w-full relative">
+    <div ref={containerRef} className="h-full w-full relative overflow-hidden">
       <canvas
         ref={canvasRef}
-        style={{ width: '100%', height: '100%' }}
+        className="block"
         onClick={handleClick}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => setHoveredPoint(null)}

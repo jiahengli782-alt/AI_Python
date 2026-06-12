@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import clsx from 'clsx';
-import type { AgentFailureType, AgentTraceDiagnosis, PropagationEdge } from './AgentDiagnosisPanel';
+import type { AgentFailureType, AgentTraceDiagnosis, PropagationEdge, ProvenanceEdge, ProvenanceNode } from './AgentDiagnosisPanel';
 
 interface Subprocess {
   id: string;
@@ -21,6 +21,8 @@ interface Subprocess {
   failure_reason?: string;
   diagnosis_status?: 'normal' | 'warning' | 'failure';
   diagnosis_evidence?: string[];
+  provenance_nodes?: ProvenanceNode[];
+  provenance_edges?: ProvenanceEdge[];
   observed_signals?: string[];
   evidence_source?: string;
   potential_risks?: {
@@ -48,6 +50,12 @@ export interface TreePreviewResult {
   fullResult?: string;
 }
 
+export interface TreePromptOpenRequest {
+  stepId: string;
+  prompt: string;
+  nonce: number;
+}
+
 interface TreeSuggestion {
   id: string;
   stepId: string;
@@ -64,6 +72,8 @@ type DetailTarget =
   | EditingTarget
   | { type: 'final' };
 
+type TreeViewMode = 'flow' | 'provenance' | 'propagation';
+
 interface PromptTreePanelProps {
   goal: string;
   subprocesses: Subprocess[];
@@ -73,6 +83,7 @@ interface PromptTreePanelProps {
   promptDrafts: Record<string, string>;
   previewResults: TreePreviewResult[];
   previewFinalOutput: string;
+  externalPromptRequest?: TreePromptOpenRequest | null;
   traceDiagnosis?: AgentTraceDiagnosis | null;
   canUndoTreeChange: boolean;
   isPreviewing: boolean;
@@ -144,6 +155,7 @@ export function PromptTreePanel({
   promptDrafts,
   previewResults,
   previewFinalOutput,
+  externalPromptRequest,
   traceDiagnosis,
   canUndoTreeChange,
   isPreviewing,
@@ -159,6 +171,7 @@ export function PromptTreePanel({
   const [isDetailExpanded, setIsDetailExpanded] = useState(false);
   const [draftPrompt, setDraftPrompt] = useState('');
   const [zoom, setZoom] = useState(0.92);
+  const [treeView, setTreeView] = useState<TreeViewMode>('flow');
   const suggestionsByStep = useMemo(() => {
     const result: Record<string, TreeSuggestion[]> = {};
     subprocesses.forEach((step, index) => {
@@ -239,12 +252,12 @@ export function PromptTreePanel({
       }).join('\n\n')}`);
     }
     if (step.diagnosis_status === 'failure') {
-      blocks.push(`【可能错误类型】${step.failure_label || step.failure_type || '未知错误'}`);
+      blocks.push(`【错误类型】${step.failure_label || step.failure_type || '未知错误'}`);
       if (step.evidence_source) {
-        blocks.push(`【可能出错的文字源头】\n${step.evidence_source}`);
+        blocks.push(`【错误证据文字源头】\n${step.evidence_source}`);
       }
       if (step.failure_reason) {
-        blocks.push(`【为什么可能错】\n${step.failure_reason}`);
+        blocks.push(`【为什么错】\n${step.failure_reason}`);
       }
       if (step.affected_steps?.length) {
         blocks.push(`【真实影响到】Step ${step.affected_steps.join(', Step ')}`);
@@ -322,6 +335,21 @@ export function PromptTreePanel({
   }, [resetSignal]);
 
   useEffect(() => {
+    if (!externalPromptRequest) return;
+    const step = subprocesses.find(item => item.id === externalPromptRequest.stepId);
+    if (!step) return;
+    onSelectStep(step.id);
+    setEditingTarget({ type: 'current', stepId: step.id });
+    setDetailTarget({ type: 'current', stepId: step.id });
+    setDraftPrompt(externalPromptRequest.prompt);
+    setIsDetailExpanded(false);
+    setResultDetail({
+      title: `${step.name} 的修复 Prompt 已同步`,
+      content: '已同步到下方 Prompt 编辑框。你可以继续人工修改，确认后点击左侧弹窗里的“试运行”查看该指定步骤及后续链路变化。',
+    });
+  }, [externalPromptRequest?.nonce]);
+
+  useEffect(() => {
     if (!detailTarget) return;
 
     if (detailTarget.type === 'final') {
@@ -365,6 +393,365 @@ export function PromptTreePanel({
     editingTarget &&
     previewResults.some(item => item.stepId === editingTarget.stepId && item.status === 'changed')
   );
+
+  const sourceTypeLabel = (type: string) => {
+    const labels: Record<string, string> = {
+      question: '用户问题',
+      previous_step: '上一步',
+      step: '当前步骤',
+      downstream_step: '下游步骤',
+      prompt: 'Prompt',
+      document: '文档证据',
+      tool: '工具/API',
+      log: '日志错误',
+      memory: '上下文',
+    };
+    return labels[type] || type;
+  };
+
+  const edgeLabel = (relation: string) => {
+    const labels: Record<string, string> = {
+      initial_input: '作为初始输入',
+      previous_output_to_input: '上一步输出进入本步',
+      controls_generation: '控制本步生成',
+      document_evidence_used: '文档证据进入本步',
+      cited_evidence: '引用证据进入本步',
+      tool_result_used: '工具结果进入本步',
+      runtime_signal: '日志/错误信号进入本步',
+      context_carried: '上下文被带入',
+      output_used_by_downstream: '本步输出进入下游',
+    };
+    return labels[relation] || relation;
+  };
+
+  const renderProvenanceView = () => (
+    <div className="min-w-[620px] space-y-3">
+      {subprocesses.map((step) => {
+        const nodes = step.provenance_nodes || [];
+        const edges = step.provenance_edges || [];
+        const warningNodes = nodes.filter(node => node.status === 'warning' || node.status === 'failure');
+        return (
+          <button
+            key={step.id}
+            onClick={() => openCurrentStep(step)}
+            className={clsx(
+              'w-full rounded-xl border bg-white p-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md',
+              step.diagnosis_status === 'failure' ? 'border-red-300 bg-red-50/50' :
+                warningNodes.length ? 'border-amber-200 bg-amber-50/40' :
+                  'border-slate-200'
+            )}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="font-semibold text-slate-800">Step {step.order}: {step.name}</div>
+              <div className="flex flex-wrap gap-1">
+                {nodes.slice(0, 5).map(node => (
+                  <span
+                    key={node.id}
+                    className={clsx(
+                      'rounded-full px-2 py-0.5 text-[10px] font-medium ring-1',
+                      node.type === 'document' ? 'bg-emerald-50 text-emerald-700 ring-emerald-100' :
+                        node.type === 'log' || node.type === 'tool' ? 'bg-amber-50 text-amber-700 ring-amber-100' :
+                          node.type === 'prompt' ? 'bg-purple-50 text-purple-700 ring-purple-100' :
+                            'bg-slate-50 text-slate-600 ring-slate-100'
+                    )}
+                    title={node.detail || node.label}
+                  >
+                    {sourceTypeLabel(node.type)}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <div className="mt-2 grid gap-2 md:grid-cols-2">
+              <div className="rounded-lg border border-slate-100 bg-slate-50 p-2">
+                <div className="text-[11px] font-semibold text-slate-500">证据来源节点</div>
+                <div className="mt-1 space-y-1">
+                  {nodes.length ? nodes.slice(0, 6).map(node => (
+                    <div key={node.id} className="truncate text-[11px] text-slate-600" title={node.detail || node.label}>
+                      <span className="font-medium text-slate-700">{sourceTypeLabel(node.type)}</span> · {node.label}
+                    </div>
+                  )) : (
+                    <div className="text-[11px] text-slate-400">暂无可观测来源节点</div>
+                  )}
+                </div>
+              </div>
+              <div className="rounded-lg border border-slate-100 bg-slate-50 p-2">
+                <div className="text-[11px] font-semibold text-slate-500">信息流向边</div>
+                <div className="mt-1 space-y-1">
+                  {edges.length ? edges.slice(0, 6).map((edge, idx) => (
+                    <div key={`${edge.source}-${edge.target}-${idx}`} className="truncate text-[11px] text-slate-600" title={edge.evidence || edge.relation}>
+                      <span className={clsx('font-medium', edge.status === 'warning' || edge.status === 'failure' ? 'text-red-600' : 'text-slate-700')}>
+                        {edgeLabel(edge.relation)}
+                      </span>
+                      {' '}· {edge.source} → {edge.target}
+                    </div>
+                  )) : (
+                    <div className="text-[11px] text-slate-400">暂无可观测流向边</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  const renderPropagationView = () => (
+    <div className="min-w-[620px] space-y-3">
+      {subprocesses.map((step) => {
+        const isFailure = step.diagnosis_status === 'failure';
+        const isAffected = affectedStepOrders.has(step.order);
+        const preview = previewResults.find(item => item.stepId === step.id && item.status !== 'unchanged');
+        const risks = step.potential_risks || [];
+        return (
+          <button
+            key={step.id}
+            onClick={() => openCurrentStep(step, preview)}
+            className={clsx(
+              'w-full rounded-xl border p-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md',
+              isFailure ? 'border-red-300 bg-red-50' :
+                isAffected ? 'border-amber-300 bg-amber-50' :
+                  risks.length ? 'border-sky-200 bg-sky-50/70' :
+                    'border-slate-200 bg-white'
+            )}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="font-semibold text-slate-800">Step {step.order}: {step.name}</div>
+              <div className="flex flex-wrap gap-1.5 text-[10px]">
+                {isFailure && <span className="rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-700">错误源</span>}
+                {isAffected && <span className="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-700">受影响</span>}
+                {risks.length > 0 && <span className="rounded-full bg-sky-100 px-2 py-0.5 font-medium text-sky-700">可能风险</span>}
+              </div>
+            </div>
+            <div className="mt-2 grid gap-2 text-[11px] md:grid-cols-3">
+              <div className="rounded-lg bg-white/70 p-2 text-slate-600">
+                <span className="font-semibold text-slate-500">Where 去向：</span>
+                {step.where_to_steps?.length ? `Step ${step.where_to_steps.join(', Step ')}` : '暂无下游'}
+              </div>
+              <div className="rounded-lg bg-white/70 p-2 text-slate-600">
+                <span className="font-semibold text-slate-500">影响：</span>
+                {step.affected_steps?.length ? `Step ${step.affected_steps.join(', Step ')}` : isAffected ? '来自上游错误' : '无红色传播'}
+              </div>
+              <div className="rounded-lg bg-white/70 p-2 text-slate-600">
+                <span className="font-semibold text-slate-500">依据：</span>
+                {compactText(step.evidence_source || step.observed_signals?.join(', ') || risks[0]?.reason || '暂无错误证据', 52)}
+              </div>
+            </div>
+            {step.propagation_edges?.length ? (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {step.propagation_edges.map((edge, idx) => (
+                  <span key={idx} className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700">
+                    Step {edge.from_step} → Step {edge.to_step}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  const visualNodeTone = (type: string, status?: string) => {
+    if (status === 'failure') return 'border-red-300 bg-red-50 text-red-800 shadow-red-100';
+    if (status === 'warning') return 'border-amber-300 bg-amber-50 text-amber-800 shadow-amber-100';
+    if (type === 'document') return 'border-emerald-200 bg-emerald-50 text-emerald-800';
+    if (type === 'log' || type === 'tool') return 'border-amber-200 bg-amber-50 text-amber-800';
+    if (type === 'prompt') return 'border-purple-200 bg-purple-50 text-purple-800';
+    if (type === 'downstream_step') return 'border-sky-200 bg-sky-50 text-sky-800';
+    return 'border-slate-200 bg-white text-slate-700';
+  };
+
+  const fallbackProvenanceGraph = (step: Subprocess): { nodes: ProvenanceNode[]; edges: ProvenanceEdge[] } => {
+    const nodes: ProvenanceNode[] = [];
+    const edges: ProvenanceEdge[] = [];
+    const stepNode = `step:${step.order}`;
+    const logPattern = /(API调用失败|SetLimitExceeded|quota|429|401|403|404|exception|traceback|failed|error|错误码|报错|调用失败)/i;
+    const documentPattern = /(已上传文档|片段\s*\d+|文件名|来源|引用|\.pdf|\.docx|\.csv|\.txt|网上搜索|检索结果|网页|资料)/i;
+    const shortEvidence = (text?: string) => compactText(text || '', 110);
+    const addNode = (node: ProvenanceNode) => {
+      if (!nodes.some(item => item.id === node.id)) nodes.push(node);
+    };
+    const addEdge = (edge: ProvenanceEdge) => {
+      if (!edges.some(item => item.source === edge.source && item.target === edge.target && item.relation === edge.relation)) edges.push(edge);
+    };
+
+    addNode({ id: stepNode, type: 'step', label: `Step ${step.order}: ${step.name}`, detail: step.output || step.description || step.input, status: step.diagnosis_status });
+    if (step.order === 1) {
+      addNode({ id: 'source:user_query', type: 'question', label: 'User question', detail: step.input || goal });
+      addEdge({ source: 'source:user_query', target: stepNode, relation: 'initial_input', evidence: step.input || goal });
+    } else {
+      const prev = subprocesses[step.order - 2];
+      const inheritedText = prev?.output || prev?.description || '';
+      addNode({ id: `step:${step.order - 1}`, type: 'previous_step', label: `上游输出 Step ${step.order - 1}: ${prev?.name || 'previous step'}`, detail: inheritedText });
+      addEdge({ source: `step:${step.order - 1}`, target: stepNode, relation: 'previous_output_to_input', evidence: step.input || inheritedText });
+    }
+    if (step.systemPrompt || step.userPrompt || step.userPromptTemplate) {
+      addNode({ id: `prompt:${step.order}`, type: 'prompt', label: `Prompt for Step ${step.order}`, detail: step.systemPrompt || step.userPromptTemplate || step.userPrompt });
+      addEdge({ source: `prompt:${step.order}`, target: stepNode, relation: 'controls_generation', evidence: step.systemPrompt || step.userPromptTemplate });
+    }
+    (step.source_refs || []).filter(ref => ref !== 'user_query' && !ref.startsWith('previous_step')).slice(0, 3).forEach((ref, idx) => {
+      const id = `source:${step.order}:${idx}`;
+      const refText = ref.toLowerCase();
+      const type = refText.includes('tool') || refText.includes('api') ? 'tool' : refText.includes('log') ? 'log' : 'document';
+      const detail = type === 'log'
+        ? (logPattern.test(step.evidence_source || '') ? step.evidence_source : '')
+        : type === 'tool'
+          ? shortEvidence(step.output || step.input)
+          : shortEvidence(documentPattern.test(step.output || '') ? step.output : step.input || step.output);
+      addNode({ id, type, label: type === 'document' ? `外部资料/检索来源：${ref}` : ref, detail });
+      addEdge({ source: id, target: stepNode, relation: type === 'tool' ? 'tool_result_used' : 'document_evidence_used', evidence: step.evidence_source });
+    });
+    if (step.evidence_source && logPattern.test(step.evidence_source)) {
+      const id = `evidence:${step.order}`;
+      addNode({ id, type: 'log', label: '日志/API错误源头', detail: step.evidence_source, status: step.diagnosis_status });
+      addEdge({ source: id, target: stepNode, relation: 'runtime_signal', status: step.diagnosis_status, evidence: step.evidence_source });
+    } else if (step.evidence_source && documentPattern.test(step.evidence_source)) {
+      const id = `evidence:${step.order}`;
+      addNode({ id, type: 'document', label: '文档/检索证据片段', detail: step.evidence_source, status: step.diagnosis_status });
+      addEdge({ source: id, target: stepNode, relation: 'document_evidence_used', status: step.diagnosis_status, evidence: step.evidence_source });
+    }
+    (step.where_to_steps || []).slice(0, 3).forEach(target => {
+      const targetStep = subprocesses[target - 1];
+      addNode({ id: `step:${target}`, type: 'downstream_step', label: `Step ${target}: ${targetStep?.name || 'downstream'}`, detail: targetStep?.input || targetStep?.output || '' });
+      addEdge({ source: stepNode, target: `step:${target}`, relation: 'output_used_by_downstream', evidence: step.output });
+    });
+    return { nodes, edges };
+  };
+
+  const getVisibleProvenanceGraph = (step: Subprocess) => {
+    const fallback = fallbackProvenanceGraph(step);
+    return {
+      nodes: step.provenance_nodes?.length ? step.provenance_nodes : fallback.nodes,
+      edges: step.provenance_edges?.length ? step.provenance_edges : fallback.edges,
+    };
+  };
+
+  const renderVisualProvenanceView = () => (
+    <div
+      className="min-w-[900px] space-y-4 pb-3 transition-transform duration-150"
+      style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}
+    >
+      {subprocesses.map((step) => {
+        const graph = getVisibleProvenanceGraph(step);
+        const currentNode = graph.nodes.find(node => node.type === 'step' || node.id === `step:${step.order}`) || graph.nodes[0];
+        const sourceNodes = graph.nodes.filter(node => node.id !== currentNode?.id && node.type !== 'downstream_step').slice(0, 5);
+        const downstreamNodes = graph.nodes
+          .filter(node => node.type === 'downstream_step' || (/^step:\d+/.test(node.id) && node.id !== `step:${step.order}` && Number(node.id.split(':')[1]) > step.order))
+          .slice(0, 4);
+        const rowHeight = Math.max(230, Math.max(sourceNodes.length, downstreamNodes.length, 1) * 54 + 78);
+        const centerY = Math.round(rowHeight / 2);
+        const sourceY = (idx: number) => 44 + idx * Math.max(44, Math.min(58, (rowHeight - 96) / Math.max(sourceNodes.length, 1)));
+        const downstreamY = (idx: number) => 44 + idx * Math.max(44, Math.min(58, (rowHeight - 96) / Math.max(downstreamNodes.length, 1)));
+
+        return (
+          <div key={step.id} className="relative w-[900px] rounded-2xl border border-slate-200 bg-white/95 p-3 shadow-sm">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-xs font-semibold text-slate-700">Step {step.order} 证据来源图</div>
+              <div className="flex gap-1 text-[10px] text-slate-400">
+                <span>{sourceNodes.length} 个来源节点</span><span>·</span><span>{graph.edges.length} 条信息边</span>
+              </div>
+            </div>
+            <div className="relative rounded-xl bg-slate-50" style={{ height: rowHeight }}>
+              <svg className="absolute inset-0 h-full w-full overflow-visible" aria-hidden="true">
+                {sourceNodes.map((node, idx) => (
+                  <path key={`source-${node.id}`} d={`M 230 ${sourceY(idx) + 18} C 300 ${sourceY(idx) + 18}, 318 ${centerY}, 385 ${centerY}`} stroke={node.status === 'failure' ? '#ef4444' : node.status === 'warning' ? '#f59e0b' : '#94a3b8'} strokeWidth={node.status === 'failure' ? 2.6 : 1.8} fill="none" strokeLinecap="round" strokeDasharray={node.type === 'prompt' ? '4 4' : undefined} />
+                ))}
+                {downstreamNodes.map((node, idx) => {
+                  const order = Number(node.id.split(':')[1]);
+                  const affected = step.diagnosis_status === 'failure' && step.affected_steps?.includes(order);
+                  return <path key={`downstream-${node.id}`} d={`M 515 ${centerY} C 585 ${centerY}, 600 ${downstreamY(idx) + 18}, 670 ${downstreamY(idx) + 18}`} stroke={affected ? '#ef4444' : '#38bdf8'} strokeWidth={affected ? 2.6 : 1.8} fill="none" strokeLinecap="round" strokeDasharray={affected ? '6 4' : undefined} />;
+                })}
+              </svg>
+
+              {sourceNodes.map((node, idx) => (
+                <button key={node.id} onClick={() => setResultDetail({ title: `${sourceTypeLabel(node.type)}：${node.label}`, content: node.detail || '暂无详情' })} className={clsx('absolute left-5 w-[205px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', visualNodeTone(node.type, node.status))} style={{ top: sourceY(idx) }} title={node.detail || node.label}>
+                  <div className="font-semibold">{sourceTypeLabel(node.type)}</div>
+                  <div className="mt-0.5 truncate">{node.label}</div>
+                </button>
+              ))}
+
+              <button onClick={() => openCurrentStep(step)} className={clsx('absolute left-[385px] w-[130px] rounded-xl border-2 px-3 py-3 text-left shadow-md transition hover:-translate-y-0.5', step.diagnosis_status === 'failure' ? 'border-red-400 bg-red-50 text-red-800' : step.potential_risks?.length ? 'border-sky-300 bg-sky-50 text-sky-800' : 'border-slate-300 bg-white text-slate-800')} style={{ top: centerY - 45 }} title={currentNode?.detail || getStepFullResult(step)}>
+                <div className="text-[11px] font-semibold">STEP {step.order}</div>
+                <div className="mt-1 text-xs font-bold leading-4">{compactText(step.name, 26)}</div>
+                <div className="mt-1 text-[10px] leading-4 text-slate-500">{compactText(getStepResultSummary(step), 34)}</div>
+              </button>
+
+              {downstreamNodes.map((node, idx) => (
+                <button key={node.id} onClick={() => { const target = subprocesses[Number(node.id.split(':')[1]) - 1]; if (target) openCurrentStep(target); }} className={clsx('absolute left-[670px] w-[205px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', visualNodeTone(node.type, node.status))} style={{ top: downstreamY(idx) }} title={node.detail || node.label}>
+                  <div className="font-semibold">下游使用</div>
+                  <div className="mt-0.5 truncate">{node.label}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const renderVisualPropagationView = () => {
+    const height = Math.max(360, subprocesses.length * 112 + 80);
+    const flowEdges = dataflowEdges.filter(edge => edge.to_step <= subprocesses.length);
+    const redEdges = (propagationEdges.length ? propagationEdges : subprocesses.flatMap(step => (
+      step.diagnosis_status === 'failure'
+        ? (step.affected_steps || step.where_to_steps || []).map(target => ({ from_step: step.order, to_step: target, failure_type: step.failure_type, reason: step.failure_reason, source_excerpt: step.evidence_source }))
+        : []
+    ))).filter(edge => edge.to_step > 0 && edge.to_step <= subprocesses.length);
+    const yOf = (order: number) => 42 + (order - 1) * 112;
+
+    return (
+      <div className="min-w-[880px] pb-4 transition-transform duration-150" style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}>
+        <div className="relative w-[880px] rounded-2xl border border-slate-200 bg-white p-3 shadow-sm" style={{ height }}>
+          <div className="absolute left-5 top-3 text-[11px] font-semibold text-slate-500">错误/风险源</div>
+          <div className="absolute left-[340px] top-3 text-[11px] font-semibold text-slate-500">工作流 Step</div>
+          <div className="absolute right-8 top-3 text-[11px] font-semibold text-slate-500">受影响位置</div>
+          <svg className="absolute inset-0 h-full w-full overflow-visible" aria-hidden="true">
+            {flowEdges.map(edge => <path key={`flowgraph-${edge.from_step}-${edge.to_step}`} d={`M 420 ${yOf(edge.from_step) + 46} C 300 ${yOf(edge.from_step) + 46}, 300 ${yOf(edge.to_step) + 46}, 420 ${yOf(edge.to_step) + 46}`} stroke="#cbd5e1" strokeWidth="1.5" fill="none" strokeLinecap="round" />)}
+            {redEdges.map((edge, idx) => <path key={`redgraph-${edge.from_step}-${edge.to_step}-${idx}`} d={`M 510 ${yOf(edge.from_step) + 34} C 610 ${yOf(edge.from_step) + 34}, 615 ${yOf(edge.to_step) + 34}, 715 ${yOf(edge.to_step) + 34}`} stroke="#ef4444" strokeWidth="2.7" strokeDasharray="6 4" fill="none" strokeLinecap="round" />)}
+          </svg>
+
+          {subprocesses.map(step => {
+            const isFailure = step.diagnosis_status === 'failure';
+            const isAffected = affectedStepOrders.has(step.order);
+            const hasRisk = Boolean(step.potential_risks?.length);
+            const preview = previewResults.find(item => item.stepId === step.id && item.status !== 'unchanged');
+            const y = yOf(step.order);
+            return (
+              <div key={step.id}>
+                {(isFailure || hasRisk) && (
+                  <button onClick={() => openCurrentStep(step, preview)} className={clsx('absolute left-5 w-[210px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', isFailure ? 'border-red-300 bg-red-50 text-red-800' : 'border-sky-200 bg-sky-50 text-sky-800')} style={{ top: y }} title={step.evidence_source || step.potential_risks?.[0]?.reason || step.failure_reason}>
+                    <div className="font-semibold">{isFailure ? '真实错误源' : '可能风险源'}</div>
+                    <div className="mt-0.5 truncate">{isFailure ? (step.failure_label || step.failure_type) : (step.potential_issue_tags?.slice(0, 2).join('、') || step.potential_risks?.[0]?.label)}</div>
+                    <div className="mt-0.5 truncate text-[10px] opacity-75">{compactText(step.evidence_source || step.potential_risks?.[0]?.reason || '', 34)}</div>
+                  </button>
+                )}
+
+                <button onClick={() => openCurrentStep(step, preview)} className={clsx('absolute left-[330px] w-[190px] rounded-xl border-2 px-3 py-2 text-left shadow-sm transition hover:-translate-y-0.5', isFailure ? 'border-red-400 bg-red-50 text-red-800' : isAffected ? 'border-amber-400 bg-amber-50 text-amber-800' : hasRisk ? 'border-sky-300 bg-sky-50 text-sky-800' : 'border-slate-300 bg-white text-slate-800')} style={{ top: y }}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold">STEP {step.order}</span>
+                    <span className={clsx('h-2.5 w-2.5 rounded-full', isFailure ? 'bg-red-500' : isAffected ? 'bg-amber-500' : hasRisk ? 'bg-sky-500' : 'bg-slate-300')} />
+                  </div>
+                  <div className="mt-1 truncate text-xs font-bold">{step.name}</div>
+                  <div className="mt-1 truncate text-[10px] opacity-75">去向：{step.where_to_steps?.length ? `Step ${step.where_to_steps.join(', Step ')}` : '暂无下游'}</div>
+                </button>
+
+                {(isAffected || step.affected_steps?.length || isFailure) && (
+                  <button onClick={() => openCurrentStep(step, preview)} className={clsx('absolute left-[715px] w-[140px] rounded-lg border px-2 py-1.5 text-left text-[11px] shadow-sm transition hover:-translate-y-0.5', isAffected ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-red-200 bg-red-50 text-red-700')} style={{ top: y }}>
+                    <div className="font-semibold">{isAffected ? '被上游影响' : '影响下游'}</div>
+                    <div className="mt-0.5 truncate">{step.affected_steps?.length ? `Step ${step.affected_steps.join(', ')}` : isAffected ? '来自上游红线' : '等待下游使用'}</div>
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  void renderProvenanceView;
+  void renderPropagationView;
 
   const BranchButton = ({ suggestion }: { suggestion?: TreeSuggestion }) => {
     const isActiveSuggestion =
@@ -424,6 +811,24 @@ export function PromptTreePanel({
         </div>
         <div className="flex items-center gap-1.5">
           <div className="flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+            {([
+              ['flow', '流程'],
+              ['provenance', '证据来源'],
+              ['propagation', '错误传播'],
+            ] as [TreeViewMode, string][]).map(([mode, label]) => (
+              <button
+                key={mode}
+                onClick={() => setTreeView(mode)}
+                className={clsx(
+                  'rounded px-2 py-1 text-[11px] transition',
+                  treeView === mode ? 'bg-white font-medium text-slate-800 shadow-sm' : 'text-slate-500 hover:bg-white/70'
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5">
             <button
               onClick={() => changeZoom(-0.08)}
               className="w-6 h-6 rounded text-xs text-slate-500 hover:bg-white hover:text-slate-700"
@@ -462,6 +867,10 @@ export function PromptTreePanel({
           <div className="h-full border border-dashed border-slate-200 rounded-lg flex items-center justify-center text-xs text-slate-400">
             输入问题后生成Goal与子过程树
           </div>
+        ) : treeView === 'provenance' ? (
+          renderVisualProvenanceView()
+        ) : treeView === 'propagation' ? (
+          renderVisualPropagationView()
         ) : (
           <div
             className="min-w-[760px] pb-2 transition-transform duration-150"
@@ -708,7 +1117,7 @@ export function PromptTreePanel({
               <>
                 <div className="mt-2 flex items-center justify-between">
                   <span className="text-[11px] text-slate-400">
-                    完整 System Prompt（可滚动 / 放大编辑），共 {draftPrompt.length} 字
+                    同步修复 Prompt（含 System 角色 + User 输入模板，可人工修改），共 {draftPrompt.length} 字
                   </span>
                   <button
                     onClick={() => setIsDetailExpanded(true)}
@@ -723,6 +1132,7 @@ export function PromptTreePanel({
                   rows={8}
                   className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs leading-relaxed resize-y focus:outline-none focus:ring-2 focus:ring-red-300 font-mono"
                   style={{ minHeight: 140, maxHeight: 360 }}
+                  placeholder="这里会同步修复建议生成的 System Prompt 与 User Prompt 输入模板；你可以人工修改后再试运行。"
                 />
                 <div className="mt-2 flex items-center justify-between gap-2">
                   <button
@@ -773,10 +1183,10 @@ export function PromptTreePanel({
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div>
                 <div className="text-sm font-semibold text-slate-800">
-                  {editingTarget ? `${editorTitle}（放大编辑）` : resultDetail?.title}
+                  {editingTarget ? `${editorTitle}（修复 Prompt 放大编辑）` : resultDetail?.title}
                 </div>
                 <div className="mt-0.5 text-[11px] text-slate-400">
-                  {editingTarget ? '可直接修改 Prompt 后点试运行 / 采纳' : '完整内容，可滚动查看'}
+                  {editingTarget ? '主要修改 User Prompt 输入模板；确认后点试运行 / 采纳' : '完整内容，可滚动查看'}
                 </div>
               </div>
               <button
@@ -804,6 +1214,7 @@ export function PromptTreePanel({
                   className="w-full rounded border border-slate-200 px-3 py-2 text-sm leading-7 font-mono resize-y focus:outline-none focus:ring-2 focus:ring-red-300"
                   style={{ minHeight: '50vh', maxHeight: '65vh' }}
                   placeholder="编辑 System Prompt..."
+                  aria-label="编辑同步修复 Prompt"
                 />
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs text-slate-400">共 {draftPrompt.length} 字符</span>

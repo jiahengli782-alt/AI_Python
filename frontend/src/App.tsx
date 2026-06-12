@@ -1,10 +1,10 @@
 import { useEffect, useState, useRef } from 'react';
 import clsx from 'clsx';
 import { ModificationFlow } from './components/ModificationFlow';
-import { PromptTreePanel, type TreePreviewResult } from './components/PromptTreePanel';
+import { PromptTreePanel, type TreePreviewResult, type TreePromptOpenRequest } from './components/PromptTreePanel';
 import { ChatHistoryPanel, type ConversationSnapshot } from './components/ChatHistoryPanel';
 import { SettingsModal, loadSettings, saveSettings, type UserSettings } from './components/SettingsModal';
-import { AgentDiagnosisPanel, type AgentTraceDiagnosis, type AgentStageType, type AgentFailureType } from './components/AgentDiagnosisPanel';
+import { AgentDiagnosisPanel, type AgentTraceDiagnosis, type AgentStageType, type AgentFailureType, type ProvenanceEdge, type ProvenanceNode } from './components/AgentDiagnosisPanel';
 
 const CONVERSATIONS_STORAGE_KEY = 'agent_conversations_v1';
 const ACTIVE_CONVERSATION_STORAGE_KEY = 'agent_active_conversation_v1';
@@ -230,17 +230,24 @@ interface Subprocess {
   failure_type?: AgentFailureType;
   failure_label?: string;
   failure_confidence?: number;
+  evidence_strength_basis?: string[];
+  failure_reason_summary?: string;
   failure_reason?: string;
   diagnosis_status?: 'normal' | 'warning' | 'failure';
   observed_signals?: string[];
   evidence_source?: string;
   diagnosis_evidence?: string[];
+  provenance_nodes?: ProvenanceNode[];
+  provenance_edges?: ProvenanceEdge[];
   potential_risks?: {
     failure_type: AgentFailureType;
+    subtype?: string;
     label?: string;
     confidence?: number;
+    reason_summary?: string;
     reason?: string;
     source_excerpt?: string;
+    matched_signals?: string[];
     suggested_fix?: string;
     suggested_fixes?: string[];
     severity?: 'low' | 'medium' | 'high';
@@ -283,6 +290,23 @@ interface TreeEditSnapshot {
   selectedStepId: string | null;
   treePromptDrafts: Record<string, string>;
   subprocesses: Subprocess[];
+}
+
+interface ReplayRecord {
+  id: string;
+  timestamp: number;
+  stepId: string;
+  stepName: string;
+  stepOrder: number;
+  source: 'current' | 'suggestion';
+  promptSummary: string;
+  changedSteps: number[];
+  affectedSteps: number[];
+  finalBefore: string;
+  finalAfter: string;
+  finalBeforeFull: string;
+  finalAfterFull: string;
+  finalDelta: number;
 }
 
 function formatJsonToChinese(text: string): string {
@@ -413,11 +437,17 @@ export default function App() {
   const [treePromptDrafts, setTreePromptDrafts] = useState<Record<string, string>>({});
   const [treePreviewResults, setTreePreviewResults] = useState<TreePreviewResult[]>([]);
   const [treePreviewFinalOutput, setTreePreviewFinalOutput] = useState('');
+  const [treePreviewStages, setTreePreviewStages] = useState<Subprocess[]>([]);
+  const [treePreviewTraceDiagnosis, setTreePreviewTraceDiagnosis] = useState<AgentTraceDiagnosis | null>(null);
+  const [treePromptOpenRequest, setTreePromptOpenRequest] = useState<TreePromptOpenRequest | null>(null);
   const [treeEditSnapshot, setTreeEditSnapshot] = useState<TreeEditSnapshot | null>(null);
   const [isTreePreviewing, setIsTreePreviewing] = useState(false);
   const [treeResetSignal, setTreeResetSignal] = useState(0);
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
   const [traceDiagnosis, setTraceDiagnosis] = useState<AgentTraceDiagnosis | null>(null);
+  const [replayHistory, setReplayHistory] = useState<ReplayRecord[]>([]);
+  const [isReplayCollapsed, setIsReplayCollapsed] = useState(false);
+  const [replayDetail, setReplayDetail] = useState<{ title: string; content: string } | null>(null);
   const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([]);
   const [isUploadingDocument, setIsUploadingDocument] = useState(false);
   const [isDraggingDocument, setIsDraggingDocument] = useState(false);
@@ -602,14 +632,22 @@ export default function App() {
 
   const treePromptMarker = '【树状图摘要Prompt】';
 
+  const extractSyncedPromptSection = (prompt: string, title: string) => {
+    const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`【${escaped}】([\\s\\S]*?)(?=\\n【同步(?:System Prompt|User Prompt输入模板)】|$)`);
+    const match = prompt.match(pattern);
+    return (match?.[1] || '').trim();
+  };
+
   const mergeTreePromptIntoSystemPrompt = (systemPrompt: string, shortPrompt: string) => {
     const cleanedBase = (systemPrompt || '')
       .replace(/【树状图摘要Prompt】[\s\S]*?(?:\n\s*\n|$)/, '')
       .trim();
+    const systemPatch = extractSyncedPromptSection(shortPrompt, '同步System Prompt') || shortPrompt.trim();
 
     return [
       treePromptMarker,
-      shortPrompt.trim(),
+      systemPatch,
       '',
       cleanedBase || '请严格执行该子过程目标，并输出可供后续步骤使用的结构化结果。',
     ].join('\n');
@@ -619,10 +657,11 @@ export default function App() {
     const cleanedBase = (userTemplate || '')
       .replace(/【树状图摘要Prompt】[\s\S]*?(?:\n\s*\n|$)/, '')
       .trim();
+    const userPatch = extractSyncedPromptSection(shortPrompt, '同步User Prompt输入模板') || shortPrompt.trim();
 
     return [
       treePromptMarker,
-      shortPrompt.trim(),
+      userPatch,
       '',
       cleanedBase || '问题：{question}\n\n已知：\n{previous_output}\n\n请根据摘要Prompt生成该子过程的结构化结果。',
     ].join('\n');
@@ -705,6 +744,54 @@ export default function App() {
       .find(item => item.length >= 8 && !/^\d+[\.\)、)]?$/.test(item));
     const clean = (firstMeaningful || extracted || '暂无可预览结果').trim();
     return clean.length > maxLength ? clean.slice(0, maxLength) : clean;
+  };
+
+  const textSimilarity = (a: string, b: string) => {
+    const tokens = (text: string) => new Set((text || '').replace(/\s+/g, '').split('').filter(Boolean));
+    const left = tokens(a);
+    const right = tokens(b);
+    if (!left.size && !right.size) return 1;
+    let overlap = 0;
+    left.forEach(token => {
+      if (right.has(token)) overlap += 1;
+    });
+    return overlap / Math.max(left.size + right.size - overlap, 1);
+  };
+
+  const buildReplayRecord = (
+    targetStep: Subprocess,
+    source: 'current' | 'suggestion',
+    prompt: string,
+    previewStages: Subprocess[],
+    finalAfter: string,
+  ): ReplayRecord => {
+    const previousFinal = subprocesses[subprocesses.length - 1]?.output || '';
+    const changedSteps = previewStages
+      .map((stage, index) => {
+        const before = subprocesses[index];
+        if (!before) return index + 1;
+        const beforeText = `${before.name}\n${before.output}\n${before.description}`;
+        const afterText = `${stage.name}\n${stage.output}\n${stage.description}`;
+        return textSimilarity(beforeText, afterText) < 0.82 ? index + 1 : null;
+      })
+      .filter((item): item is number => item !== null);
+    const affectedSteps = changedSteps.filter(order => order > targetStep.order);
+    return {
+      id: `replay_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: Date.now(),
+      stepId: targetStep.id,
+      stepName: targetStep.name,
+      stepOrder: targetStep.order,
+      source,
+      promptSummary: summarizeTreeNode(prompt, 42),
+      changedSteps,
+      affectedSteps,
+      finalBefore: summarizeTreeNode(previousFinal, 56),
+      finalAfter: summarizeTreeNode(finalAfter, 56),
+      finalBeforeFull: formatJsonToChinese(previousFinal || ''),
+      finalAfterFull: finalAfter,
+      finalDelta: Math.round((1 - textSimilarity(previousFinal, finalAfter)) * 100),
+    };
   };
 
   const readSSEComplete = async (reader: ReadableStreamDefaultReader) => {
@@ -834,7 +921,14 @@ export default function App() {
           fullResult,
         };
       }));
-      setTreePreviewFinalOutput(formatJsonToChinese(data.finalOutputFull || data.finalOutput || previewStages[previewStages.length - 1]?.output || ''));
+      const finalPreviewText = formatJsonToChinese(data.finalOutputFull || data.finalOutput || previewStages[previewStages.length - 1]?.output || '');
+      setTreePreviewFinalOutput(finalPreviewText);
+      setTreePreviewStages(previewStages);
+      setTreePreviewTraceDiagnosis(data.traceDiagnosis || data.trace_diagnosis || null);
+      setReplayHistory(prev => [
+        buildReplayRecord(targetStep, source, prompt, previewStages, finalPreviewText),
+        ...prev,
+      ].slice(0, 12));
       setSelectedStepId(targetStep.id);
       setTreePromptDrafts(prev => ({ ...prev, [targetStep.id]: prompt }));
     } catch (err: any) {
@@ -849,6 +943,8 @@ export default function App() {
     const snapshot = treeEditSnapshotRef.current || treeEditSnapshot;
     setTreePreviewResults([]);
     setTreePreviewFinalOutput('');
+    setTreePreviewStages([]);
+    setTreePreviewTraceDiagnosis(null);
     if (snapshot) {
       setSubprocesses(snapshot.subprocesses.map(step => ({ ...step })));
       setEditingStepId(snapshot.editingStepId);
@@ -882,6 +978,24 @@ export default function App() {
       editingStepId === stepId ? editedSystemPrompt : (step.systemPrompt || ''),
       promptForAdoption
     ));
+    const previewHasThisStep = treePreviewResults.some(item => item.stepId === stepId && item.status === 'changed');
+    if (previewHasThisStep && treePreviewStages.length) {
+      setSubprocesses(treePreviewStages.map(item => ({ ...item })));
+      setTraceDiagnosis(treePreviewTraceDiagnosis || traceDiagnosis);
+      setTreePreviewResults([]);
+      setTreePreviewFinalOutput('');
+      setTreePreviewStages([]);
+      setTreePreviewTraceDiagnosis(null);
+      setTreeResetSignal(prev => prev + 1);
+    }
+  };
+
+  const syncDiagnosisFixToTree = (stepId: string, prompt: string) => {
+    rememberTreeSnapshot();
+    setSelectedStepId(stepId);
+    setTreePromptDrafts(prev => ({ ...prev, [stepId]: prompt }));
+    setTreePromptOpenRequest({ stepId, prompt, nonce: Date.now() });
+    setError(null);
   };
 
   const getCommitBaseStep = (step: Subprocess) =>
@@ -1004,6 +1118,7 @@ export default function App() {
       subprocesses: subprocesses.map(s => ({ ...s })),
       traceDiagnosis,
       modificationHistory: modificationHistory.map(h => ({ ...h, stages: h.stages.map(s => ({ ...s })) })),
+      replayHistory: replayHistory.map(item => ({ ...item })),
       treePromptDrafts: { ...treePromptDrafts },
       activeQuestion,
       uploadedDocuments: uploadedDocuments.map(doc => ({ ...doc })),
@@ -1069,7 +1184,7 @@ export default function App() {
     const t = setTimeout(() => saveCurrentToHistory(), 600);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatMessages, subprocesses, traceDiagnosis, modificationHistory, treePromptDrafts, uploadedDocuments]);
+  }, [chatMessages, subprocesses, traceDiagnosis, modificationHistory, replayHistory, treePromptDrafts, uploadedDocuments]);
 
   // 加载某条历史对话
   const loadConversation = (id: string) => {
@@ -1088,6 +1203,7 @@ export default function App() {
     setSubprocesses(conv.subprocesses || []);
     setTraceDiagnosis(conv.traceDiagnosis || null);
     setModificationHistory(conv.modificationHistory || []);
+    setReplayHistory(conv.replayHistory || []);
     setTreePromptDrafts(conv.treePromptDrafts || {});
     setUploadedDocuments(conv.uploadedDocuments || []);
     setActiveQuestion(conv.activeQuestion || conv.question || '');
@@ -1097,6 +1213,8 @@ export default function App() {
     setExpandedStepId(null);
     setTreePreviewResults([]);
     setTreePreviewFinalOutput('');
+    setTreePreviewStages([]);
+    setTreePreviewTraceDiagnosis(null);
     clearTreeSnapshot();
     setTreeResetSignal(prev => prev + 1);
     setError(null);
@@ -1119,6 +1237,7 @@ export default function App() {
       setSubprocesses([]);
       setTraceDiagnosis(null);
       setModificationHistory([]);
+      setReplayHistory([]);
       setTreePromptDrafts({});
       setUploadedDocuments([]);
       setActiveQuestion('');
@@ -1141,6 +1260,7 @@ export default function App() {
     setSubprocesses([]);
     setTraceDiagnosis(null);
     setModificationHistory([]);
+    setReplayHistory([]);
     setTreePromptDrafts({});
     setUploadedDocuments([]);
     setActiveQuestion('');
@@ -1149,6 +1269,8 @@ export default function App() {
     setExpandedStepId(null);
     setTreePreviewResults([]);
     setTreePreviewFinalOutput('');
+    setTreePreviewStages([]);
+    setTreePreviewTraceDiagnosis(null);
     clearTreeSnapshot();
     setTreeResetSignal(prev => prev + 1);
     setError(null);
@@ -1346,9 +1468,12 @@ export default function App() {
     setSelectedStepId(null);
     setRerunFromStep(null);
     setModificationHistory([]);
+    setReplayHistory([]);
     setTreePromptDrafts({});
     setTreePreviewResults([]);
     setTreePreviewFinalOutput('');
+    setTreePreviewStages([]);
+    setTreePreviewTraceDiagnosis(null);
     clearTreeSnapshot();
     setTreeResetSignal(prev => prev + 1);
 
@@ -1433,6 +1558,8 @@ export default function App() {
       setTreePromptDrafts({});
       setTreePreviewResults([]);
       setTreePreviewFinalOutput('');
+      setTreePreviewStages([]);
+      setTreePreviewTraceDiagnosis(null);
       clearTreeSnapshot();
       setTreeResetSignal(prev => prev + 1);
       setEditingStepId(null);
@@ -1476,6 +1603,8 @@ export default function App() {
     setTreePromptDrafts({});
     setTreePreviewResults([]);
     setTreePreviewFinalOutput('');
+    setTreePreviewStages([]);
+    setTreePreviewTraceDiagnosis(null);
     clearTreeSnapshot();
     setTreeResetSignal(prev => prev + 1);
   };
@@ -1570,6 +1699,7 @@ export default function App() {
                 promptDrafts={treePromptDrafts}
                 previewResults={treePreviewResults}
                 previewFinalOutput={treePreviewFinalOutput}
+                externalPromptRequest={treePromptOpenRequest}
                 traceDiagnosis={traceDiagnosis}
                 canUndoTreeChange={Boolean(treeEditSnapshot)}
                 isPreviewing={isTreePreviewing}
@@ -1691,6 +1821,8 @@ export default function App() {
                   <AgentDiagnosisPanel
                     steps={subprocesses}
                     traceDiagnosis={traceDiagnosis}
+                    currentQuestion={activeQuestion || chatMessages.find(m => m.role === 'user')?.content || question}
+                    onSyncFixToTree={syncDiagnosisFixToTree}
                   />
                 )}
 
@@ -1989,11 +2121,73 @@ export default function App() {
                     )}
                   </h3>
                 </div>
-                <div className="flex-1 min-h-0">
-                  <ModificationFlow
-                    modificationHistory={modificationHistory}
-                    onSelectPoint={handleSelectFromFlow}
-                  />
+                <div className="flex-1 min-h-0 flex flex-col">
+                  <div className="flex-1 min-h-[120px]">
+                    <ModificationFlow
+                      modificationHistory={modificationHistory}
+                      onSelectPoint={handleSelectFromFlow}
+                    />
+                  </div>
+                  {replayHistory.length > 0 && (
+                    <div className="border-t border-slate-100 bg-slate-50/70 p-2">
+                      <div className="mb-1 flex items-center justify-between">
+                        <span className="text-[11px] font-semibold text-slate-600">Replay 对比</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] text-slate-400">{replayHistory.length} 次试运行</span>
+                          <button
+                            type="button"
+                            onClick={() => setIsReplayCollapsed(prev => !prev)}
+                            className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-50"
+                          >
+                            {isReplayCollapsed ? '展开' : '折叠'}
+                          </button>
+                        </div>
+                      </div>
+                      {!isReplayCollapsed && <div className="max-h-44 space-y-1.5 overflow-y-auto">
+                        {replayHistory.slice(0, 4).map(record => (
+                          <div key={record.id} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] shadow-sm">
+                            <div className="flex flex-wrap items-center justify-between gap-1">
+                              <span className="font-semibold text-slate-700">
+                                Step {record.stepOrder}: {record.stepName}
+                              </span>
+                              <span className="rounded-full bg-sky-50 px-1.5 py-0.5 font-medium text-sky-700">
+                                最终变化 {record.finalDelta}%
+                              </span>
+                            </div>
+                            <div className="mt-1 text-slate-500">
+                              改动：{record.promptSummary}
+                            </div>
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-600">
+                                变化 Step {record.changedSteps.length ? record.changedSteps.join(', ') : '无明显变化'}
+                              </span>
+                              <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">
+                                影响 Step {record.affectedSteps.length ? record.affectedSteps.join(', ') : '无后续'}
+                              </span>
+                            </div>
+                            <div className="mt-1 grid gap-1 text-slate-500 md:grid-cols-2">
+                              <button
+                                type="button"
+                                onClick={() => setReplayDetail({ title: `Step ${record.stepOrder} 试运行前完整输出`, content: record.finalBeforeFull || record.finalBefore || '暂无' })}
+                                className="truncate rounded bg-slate-50 px-1.5 py-0.5 text-left hover:bg-slate-100"
+                                title={record.finalBeforeFull || record.finalBefore}
+                              >
+                                试运行前：{record.finalBefore || '暂无'}（查看）
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setReplayDetail({ title: `Step ${record.stepOrder} 试运行后完整输出`, content: record.finalAfterFull || record.finalAfter || '暂无' })}
+                                className="truncate rounded bg-sky-50 px-1.5 py-0.5 text-left text-sky-700 hover:bg-sky-100"
+                                title={record.finalAfterFull || record.finalAfter}
+                              >
+                                试运行后：{record.finalAfter || '暂无'}（查看）
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -2367,6 +2561,32 @@ export default function App() {
       )}
 
       {/* 设置面板 */}
+      {replayDetail && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 px-6 py-8"
+          onClick={() => setReplayDetail(null)}
+        >
+          <div
+            className="flex max-h-full w-full max-w-5xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+              <div className="text-sm font-semibold text-slate-800">{replayDetail.title}</div>
+              <button
+                type="button"
+                onClick={() => setReplayDetail(null)}
+                className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+              >
+                关闭
+              </button>
+            </div>
+            <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap break-words px-5 py-4 font-sans text-sm leading-7 text-slate-700">
+              {replayDetail.content}
+            </pre>
+          </div>
+        </div>
+      )}
+
       <SettingsModal
         open={showSettings}
         initialSettings={settings}

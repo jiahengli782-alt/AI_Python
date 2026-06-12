@@ -37,6 +37,22 @@ export interface PropagationEdge {
   source_excerpt?: string;
 }
 
+export interface ProvenanceNode {
+  id: string;
+  type: 'question' | 'previous_step' | 'step' | 'downstream_step' | 'prompt' | 'document' | 'tool' | 'log' | 'memory' | string;
+  label: string;
+  detail?: string;
+  status?: 'normal' | 'warning' | 'failure' | string;
+}
+
+export interface ProvenanceEdge {
+  source: string;
+  target: string;
+  relation: string;
+  status?: 'normal' | 'warning' | 'failure' | string;
+  evidence?: string;
+}
+
 export interface AgentTraceDiagnosis {
   overall_status: 'success' | 'partial_failure' | 'failure';
   main_failure_type: AgentFailureType;
@@ -72,6 +88,7 @@ export interface DiagnosisStep {
   failure_type?: AgentFailureType;
   failure_label?: string;
   failure_confidence?: number;
+  evidence_strength_basis?: string[];
   failure_reason_summary?: string;
   failure_reason?: string;
   likely_causes?: string[];
@@ -82,6 +99,8 @@ export interface DiagnosisStep {
   observed_signals?: string[];
   evidence_source?: string;
   diagnosis_evidence?: string[];
+  provenance_nodes?: ProvenanceNode[];
+  provenance_edges?: ProvenanceEdge[];
   potential_risks?: {
     failure_type: AgentFailureType;
     subtype?: string;
@@ -102,6 +121,8 @@ export interface DiagnosisStep {
 interface AgentDiagnosisPanelProps {
   steps: DiagnosisStep[];
   traceDiagnosis?: AgentTraceDiagnosis | null;
+  currentQuestion?: string;
+  onSyncFixToTree?: (stepId: string, prompt: string) => void;
 }
 
 const stageLabels: Record<string, string> = {
@@ -167,6 +188,11 @@ const compactLine = (text = '', max = 118) => {
   return clean.length > max ? `${clean.slice(0, max)}...` : clean;
 };
 
+const block = (title: string, value?: string, max = 900) => {
+  const clean = (value || '').trim();
+  return clean ? `【${title}】\n${compactLine(clean, max)}` : '';
+};
+
 const fixCategoryOf = (fix: string) => {
   if (/System Prompt/i.test(fix)) return 'System Prompt';
   if (/User Template/i.test(fix)) return 'User Template';
@@ -219,6 +245,216 @@ const buildRiskDetail = (risk: PotentialRisk) => [
   ...(risk.suggested_fixes?.length ? risk.suggested_fixes : risk.suggested_fix ? [risk.suggested_fix] : ['暂无']),
 ].filter(Boolean).join('\n');
 
+const hasAnyText = (text: string | undefined, terms: string[]) =>
+  terms.some(term => (text || '').includes(term));
+
+const buildOutputContract = (step: DiagnosisStep, labels: string[]) => {
+  const joined = `${labels.join(' ')} ${step.failure_type || ''} ${step.failure_label || ''} ${step.failure_reason || ''}`;
+  if (hasAnyText(joined, ['检索', '证据', '来源', '无证据', '引用'])) {
+    return [
+      'matched_evidence：列出可支持结论的原文证据，每条必须包含 source、snippet、supports',
+      'missing_evidence：列出仍缺少的证据；没有证据时写“证据不足”',
+      'conclusion：只基于 matched_evidence 输出本步骤结论',
+      'next_step_input：后续步骤必须继承的证据和结论',
+    ];
+  }
+  if (hasAnyText(joined, ['约束', '验证', 'when', 'where', 'why', 'how'])) {
+    return [
+      'checks：逐条列出 when、where、why、how 或用户显式约束',
+      'evidence：每条检查对应的原文/日志/上游依据',
+      'pass：true/false，不能用模糊词代替',
+      'failed_reason：未通过时写清楚缺什么输入',
+      'next_step_input：只传递已验证通过的信息',
+    ];
+  }
+  if (hasAnyText(joined, ['上下文', '遗漏', '自相矛盾', '前后'])) {
+    return [
+      'carried_over：从前序步骤必须继承的实体/状态/约束',
+      'current_decision：本步骤对这些信息的处理结果',
+      'dropped_items：如果丢弃任何项，必须说明过滤理由',
+      'consistency_check：说明是否与前序结论一致',
+      'next_step_input：后续必须使用的完整清单',
+    ];
+  }
+  if (hasAnyText(joined, ['格式', 'JSON', 'schema', '字段'])) {
+    return [
+      '严格输出可解析 JSON',
+      '包含 result、evidence、missing、next_step_input 四个字段',
+      '不要输出 Markdown 包裹或额外解释',
+    ];
+  }
+  return [
+    'result：本步骤直接可用的修复后结果',
+    'evidence：支持 result 的证据或上游依据',
+    'uncertainty：不能确认的内容和原因',
+    'next_step_input：后续步骤必须继承的信息',
+  ];
+};
+
+const buildStageSystemRules = (step: DiagnosisStep, labels: string[]) => {
+  const stage = step.stage || 'unknown';
+  const labelText = labels.length ? labels.join('、') : labelOf(step);
+  const common = [
+    `角色：你只负责 Step ${step.order}「${step.name}」这一环节。`,
+    `本次修复目标：${labelText}。`,
+    '禁止输出“建议如何修改 Prompt”的说明，必须直接产出本步骤结果。',
+    '所有事实、状态、数字、日志定位和文档结论都必须来自输入证据；没有证据就写“证据不足”。',
+  ];
+  if (stage === 'planner') {
+    return [
+      ...common,
+      '规划时必须把用户问题拆成可验证检查点，每个检查点写清需要什么证据、交给哪个后续步骤使用。',
+      '如果用户要求 when/where/why/how、引用、文档或日志定位，必须分别列为独立检查点。',
+      '输出必须包含 next_step_input，供后续步骤直接使用。',
+    ];
+  }
+  if (stage === 'retriever') {
+    return [
+      ...common,
+      '检索/证据步骤只负责找证据和判断证据是否覆盖问题，不允许提前生成最终结论。',
+      '必须优先匹配用户问题中的实体、状态、时间、功能、错误码、文档片段。',
+      '输出必须区分 matched_evidence 和 missing_evidence。',
+    ];
+  }
+  if (stage === 'generator' || stage === 'summarizer') {
+    return [
+      ...common,
+      '生成结论时只能使用输入中的 matched_evidence、上游结构化结果和用户问题。',
+      '每个事实 claim 后必须说明依据；没有依据的内容放入 uncertainty，不要写进结论。',
+      '不要丢弃前序步骤传来的实体、约束、状态和时间信息。',
+    ];
+  }
+  if (stage === 'verifier') {
+    return [
+      ...common,
+      '验证时必须逐条核验用户约束、上游结论和证据是否一致。',
+      '每个检查项必须输出 pass=true/false、证据、失败原因。',
+      '发现证据缺失、前后矛盾或格式不符时，必须明确标出 failed_reason。',
+    ];
+  }
+  if (stage === 'tool_call') {
+    return [
+      ...common,
+      '工具/API 步骤必须先校验工具名称、参数、endpoint、错误码和返回结构。',
+      '工具失败时停止编造业务结论，只输出错误边界、可重试条件和 next_step_input。',
+      '工具结果进入后续步骤前必须转成结构化字段。',
+    ];
+  }
+  return [
+    ...common,
+    '请优先保留用户硬约束、证据来源、关键实体、状态、时间和后续必须继承的信息。',
+    '输出必须结构化，能被后续步骤直接消费。',
+  ];
+};
+
+const buildUserPromptRewrite = (
+  step: DiagnosisStep,
+  fixes: { category: string; text: string }[],
+  currentQuestion?: string,
+) => {
+  const labels = [
+    step.failure_label,
+    step.failure_type,
+    ...(step.potential_issue_tags || []),
+    ...(step.potential_risks || []).map(risk => risk.label || risk.failure_type),
+  ].filter(Boolean).join('、');
+  const sourceText = step.evidence_source || step.diagnosis_evidence?.join('\n') || step.output || step.input || '';
+  const requiredInputPatch = (() => {
+    if (/context_omission|上下文|遗漏|过长|继承/.test(labels + sourceText)) {
+      return [
+        '【强制补入输入】',
+        '把上游已经出现但本步骤遗漏的信息原样放进 step_input，不允许只写“信息不足”。',
+        '必须新增字段：carried_over_facts、missing_items、source_step、next_step_input。',
+        block('carried_over_facts', sourceText || step.output || step.input, 1200),
+      ];
+    }
+    if (/retrieval_miss|证据|检索|来源|引用/.test(labels + sourceText)) {
+      return [
+        '【强制补入输入】',
+        '把用户问题中的关键实体、时间、状态、功能名、错误码拆成 retrieval_query，不允许泛泛检索。',
+        '必须新增字段：retrieval_query、matched_evidence、missing_evidence、source_refs。',
+        block('retrieval_query_basis', `${currentQuestion || ''}\n${step.input || ''}`, 1200),
+      ];
+    }
+    if (/tool_misuse|API|工具|调用|日志|错误码|SetLimitExceeded|429/i.test(labels + sourceText)) {
+      return [
+        '【强制补入输入】',
+        '把接口名、请求参数、错误码、错误消息、是否可重试作为本步骤输入，不允许继续推业务结论。',
+        '必须新增字段：tool_name、request_args、error_code、error_message、retryable、next_action。',
+        block('runtime_error_source', sourceText, 1200),
+      ];
+    }
+    if (/unsupported_claim|fact_error|幻觉|事实|无证据|状态|上线/.test(labels + sourceText)) {
+      return [
+        '【强制补入输入】',
+        '把每个结论拆成 claim，并强制为每个 claim 填 evidence_source；没有来源的 claim 必须移入 uncertainty。',
+        '必须新增字段：claims、evidence_source、unsupported_claims、uncertainty。',
+        block('claim_check_basis', `${step.output || ''}\n${sourceText}`, 1200),
+      ];
+    }
+    if (/planning_error|规划|检查项|约束/.test(labels + sourceText)) {
+      return [
+        '【强制补入输入】',
+        '把用户目标拆成可验收检查项，每个检查项必须写清需要的证据、交给哪个后续 step 使用。',
+        '必须新增字段：checks、required_evidence、where_to_step、acceptance_criteria。',
+        block('planning_basis', currentQuestion || step.input || sourceText, 1200),
+      ];
+    }
+    return [
+      '【强制补入输入】',
+      '把原始问题、上游输出、证据源和诊断原因都作为本步骤输入，不允许仅凭当前短摘要继续推理。',
+      '必须新增字段：original_question、upstream_output、evidence_source、diagnosis_reason、next_step_input。',
+    ];
+  })();
+  const additions = [
+    'original_question：原始用户问题，必须完整保留',
+    'step_input：本步骤原始输入或上游传入内容',
+    'previous_step_output：上一版本步骤输出，用于定位遗漏、矛盾或无证据结论',
+    'diagnosis_reason：为什么需要重跑这个步骤',
+    'priority_evidence_source：必须优先核对的文字源头/日志/文档片段',
+    'required_checks：本次必须补齐的检查项',
+    'output_contract：本步骤必须输出给后续的结构化字段',
+  ];
+  return [
+    '请把本步骤 User Prompt / 输入模板改成以下结构。重点是把缺失的上游信息/证据/日志强制放进输入，而不是写修改建议：',
+    '',
+    ...requiredInputPatch,
+    '',
+    ...additions.map((item, index) => `${index + 1}. ${item}`),
+    '',
+    block('original_question', currentQuestion, 1400),
+    block('step_input', step.input, 1400),
+    block('previous_step_output', step.output, 1400),
+    step.failure_reason ? block('diagnosis_reason', step.failure_reason, 1200) : '',
+    step.evidence_source ? block('priority_evidence_source', step.evidence_source, 900) : '',
+    step.evidence_strength_basis?.length ? `【diagnosis_signals】\n${step.evidence_strength_basis.join('\n')}` : '',
+    '',
+    '【required_checks】',
+    ...fixes.map((fix, index) => `${index + 1}. ${fix.category}：${fix.text}`),
+  ].filter(Boolean);
+};
+
+const buildFixPreviewPrompt = (
+  step: DiagnosisStep,
+  fixes: { category: string; text: string }[],
+  labels: string[],
+  currentQuestion?: string,
+) => {
+  const outputContract = buildOutputContract(step, labels);
+  const systemRules = buildStageSystemRules(step, labels);
+  const userRewrite = buildUserPromptRewrite(step, fixes, currentQuestion);
+  return [
+    `【同步System Prompt】`,
+    ...systemRules,
+    '',
+    `【同步User Prompt输入模板】`,
+    ...userRewrite,
+    '',
+    '【输出字段要求】',
+    ...outputContract.map((item, index) => `${index + 1}. ${item}`),
+  ].filter(Boolean).join('\n');
+};
+
 const mergeFixItems = (items: string[]) => {
   const groups = new Map<string, string[]>();
   items.forEach(item => {
@@ -263,7 +499,7 @@ const statusMeta = {
   failure: { label: 'Failure Observed', badge: 'border-red-200 bg-red-50 text-red-700' },
 };
 
-export function AgentDiagnosisPanel({ steps, traceDiagnosis }: AgentDiagnosisPanelProps) {
+export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, onSyncFixToTree }: AgentDiagnosisPanelProps) {
   const [activeTab, setActiveTab] = useState<TabKey>('when');
   const [detailModal, setDetailModal] = useState<{ title: string; content: string } | null>(null);
   const orderedSteps = useMemo(() => [...steps].sort((a, b) => (a.order || 0) - (b.order || 0)), [steps]);
@@ -484,7 +720,12 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis }: AgentDiagnosisPan
                 </div>
               )
             )}
-            {!contentFailures.length && potentialRiskSteps.map(step => (
+            {contentFailures.length > 0 && potentialRiskSteps.length > 0 && (
+              <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-700">
+                除了红色真实错误源，下面这些步骤还存在可预防的潜在推理风险。
+              </div>
+            )}
+            {potentialRiskSteps.map(step => (
               <div key={step.id} className="rounded-lg border border-sky-200 bg-white p-3">
                 <div className="font-semibold text-slate-800">Step {step.order}: 可能出现 {step.potential_issue_tags?.slice(0, 2).join('、')}</div>
                 <div className="mt-2 space-y-2">
@@ -519,7 +760,7 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis }: AgentDiagnosisPan
                   <div className="text-xs text-slate-500">证据强度 {normalizePercent(step.failure_confidence)}%</div>
                 </div>
                 <p className="mt-2 text-xs leading-5 text-slate-600">
-                  {shortStepWhy(step)}
+                  为什么错：{shortStepWhy(step)}
                   {step.failure_reason && step.failure_reason.length > 42 && (
                     <button
                       type="button"
@@ -529,7 +770,10 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis }: AgentDiagnosisPan
                           `错误类型：${labelOf(step)}`,
                           `置信度：${normalizePercent(step.failure_confidence)}%`,
                           '',
-                          `短原因：${shortStepWhy(step)}`,
+                          `为什么错：${shortStepWhy(step)}`,
+                          '',
+                          `证据强度依据：`,
+                          ...(step.evidence_strength_basis?.length ? step.evidence_strength_basis : ['暂无']),
                           '',
                           `完整错误内容与信息：`,
                           step.failure_reason || '无',
@@ -569,15 +813,27 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis }: AgentDiagnosisPan
                   <div className="font-semibold text-slate-800">
                     Step {group.step.order}: {group.step.name}
                   </div>
-                  {group.labels.length > 0 && (
-                    <div className="flex flex-wrap gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {group.labels.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
                       {group.labels.slice(0, 3).map(label => (
                         <span key={label} className={clsx('rounded-full px-2 py-0.5 text-[11px] font-medium ring-1', group.palette.chip)}>
                           {label}
                         </span>
                       ))}
-                    </div>
-                  )}
+                      </div>
+                    )}
+                    {onSyncFixToTree && (
+                      <button
+                        type="button"
+                        onClick={() => onSyncFixToTree(group.step.id, buildFixPreviewPrompt(group.step, group.fixes, group.labels, currentQuestion))}
+                        className="rounded-md bg-slate-900 px-2 py-1 text-[11px] font-medium text-white hover:bg-slate-700 disabled:opacity-40"
+                        title="把这些修复建议同步到左侧树状图的指定 Step Prompt 弹窗，可人工修改后再点试运行"
+                      >
+                        同步到左树编辑
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="mt-2 space-y-2">
                   {group.fixes.map((fix) => (

@@ -10,6 +10,7 @@ export interface ConversationSnapshot {
   subprocesses: any[];
   traceDiagnosis?: any;
   modificationHistory: any[];
+  replayHistory?: any[];
   treePromptDrafts: Record<string, string>;
   activeQuestion: string;
   uploadedDocuments?: any[];

@@ -5,7 +5,6 @@ import { PromptTreePanel, type TreePreviewResult, type TreePromptOpenRequest } f
 import { ChatHistoryPanel, type ConversationSnapshot } from './components/ChatHistoryPanel';
 import { SettingsModal, loadSettings, saveSettings, type UserSettings } from './components/SettingsModal';
 import { AgentDiagnosisPanel, type AgentTraceDiagnosis, type AgentStageType, type AgentFailureType, type ProvenanceEdge, type ProvenanceNode } from './components/AgentDiagnosisPanel';
-import { ResearchCasePanel } from './components/ResearchCasePanel';
 
 const CONVERSATIONS_STORAGE_KEY = 'agent_conversations_v1';
 const ACTIVE_CONVERSATION_STORAGE_KEY = 'agent_active_conversation_v1';
@@ -76,7 +75,7 @@ function ViewingMessageModal({ msg, onClose }: {
     >
       <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-3">
         <div>
-          <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+          <div className="flex items-center gap-2 text-xl font-bold text-red-600">
             <span
               className={clsx(
                 'inline-block px-2 py-0.5 rounded text-xs',
@@ -449,7 +448,6 @@ export default function App() {
   const [replayHistory, setReplayHistory] = useState<ReplayRecord[]>([]);
   const [isReplayCollapsed, setIsReplayCollapsed] = useState(false);
   const [replayDetail, setReplayDetail] = useState<{ title: string; content: string } | null>(null);
-  const [showResearchCasePanel, setShowResearchCasePanel] = useState(false);
   const [uploadedDocuments, setUploadedDocuments] = useState<UploadedDocument[]>([]);
   const [isUploadingDocument, setIsUploadingDocument] = useState(false);
   const [isDraggingDocument, setIsDraggingDocument] = useState(false);
@@ -2132,13 +2130,6 @@ export default function App() {
                       </span>
                     )}
                   </h3>
-                  <button
-                    type="button"
-                    onClick={() => setShowResearchCasePanel(true)}
-                    className="rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-100"
-                  >
-                    研究 Case
-                  </button>
                 </div>
                 <div className="flex-1 min-h-0 flex flex-col">
                   <div className="flex-1 min-h-[120px]">
@@ -2480,7 +2471,7 @@ export default function App() {
           <div className="flex max-h-full w-full max-w-6xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-5 py-3">
               <div>
-                <div className="text-sm font-semibold text-slate-800">
+                <div className="text-xl font-bold text-red-600">
                   STEP {expandedStep.order || subprocesses.findIndex(step => step.id === expandedStep.id) + 1}: {expandedStep.name}
                 </div>
                 <div className="mt-0.5 text-[11px] text-slate-400">决策子过程完整内容，可滚动查看</div>
@@ -2590,7 +2581,7 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
-              <div className="text-sm font-semibold text-slate-800">{replayDetail.title}</div>
+              <div className="text-xl font-bold text-red-600">{replayDetail.title}</div>
               <button
                 type="button"
                 onClick={() => setReplayDetail(null)}
@@ -2602,28 +2593,6 @@ export default function App() {
             <pre className="max-h-[72vh] overflow-y-auto whitespace-pre-wrap break-words px-5 py-4 font-sans text-sm leading-7 text-slate-700">
               {replayDetail.content}
             </pre>
-          </div>
-        </div>
-      )}
-
-      {showResearchCasePanel && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 px-6 py-8"
-          onClick={() => setShowResearchCasePanel(false)}
-        >
-          <div
-            className="max-h-full w-full max-w-4xl overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <ResearchCasePanel
-              settings={settings}
-              question={activeQuestion || chatMessages.find(m => m.role === 'user')?.content || question}
-              subprocesses={subprocesses}
-              traceDiagnosis={traceDiagnosis}
-              replayHistory={replayHistory}
-              uploadedDocuments={uploadedDocuments}
-              onClose={() => setShowResearchCasePanel(false)}
-            />
           </div>
         </div>
       )}

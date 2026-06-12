@@ -1134,7 +1134,7 @@ export function PromptTreePanel({
           <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
             <div className="flex items-center justify-between gap-2">
               <div>
-                <div className="text-xs font-semibold text-slate-700">{resultDetail?.title || editorTitle}</div>
+                <div className="text-base font-bold text-red-600">{resultDetail?.title || editorTitle}</div>
                 {editingTarget && selectedStep && (
                   <div className="text-[11px] text-slate-400 mt-0.5">同步步骤：{selectedStep.name}</div>
                 )}
@@ -1232,10 +1232,10 @@ export function PromptTreePanel({
           <div className="flex max-h-full min-h-0 w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div>
-                <div className={clsx('font-bold', editingTarget ? 'text-base text-slate-800' : 'text-xl text-red-600')}>
+                <div className="text-2xl font-bold text-red-600">
                   {editingTarget ? `${editorTitle}（修复 Prompt 放大编辑）` : resultDetail?.title}
                 </div>
-                <div className={clsx('mt-1 font-semibold', editingTarget ? 'text-[11px] text-slate-400' : 'text-sm text-red-500')}>
+                <div className="mt-1 text-sm font-semibold text-red-500">
                   {editingTarget ? '主要修改 User Prompt 输入模板；确认后点试运行 / 采纳' : '完整内容，可滚动查看'}
                 </div>
               </div>

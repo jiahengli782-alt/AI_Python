@@ -185,7 +185,17 @@ const stepPalettes = [
 
 const compactLine = (text = '', max = 118) => {
   const clean = text.replace(/\s+/g, ' ').trim();
-  return clean.length > max ? `${clean.slice(0, max)}...` : clean;
+  if (clean.length <= max) return clean;
+  const cut = clean.slice(0, max);
+  const boundary = Math.max(
+    cut.lastIndexOf('。'),
+    cut.lastIndexOf('；'),
+    cut.lastIndexOf('，'),
+    cut.lastIndexOf(';'),
+    cut.lastIndexOf(','),
+    cut.lastIndexOf(' ')
+  );
+  return cut.slice(0, boundary > Math.max(24, Math.floor(max / 2)) ? boundary : max).trim();
 };
 
 const block = (title: string, value?: string, max = 900) => {
@@ -222,26 +232,55 @@ const fixCategoryOf = (fix: string) => {
 const cleanFixText = (fix: string) =>
   fix.replace(/^(System Prompt|User Template|输出格式|后续约束|确认提交前|最终回答)[:：]\s*/i, '').trim();
 
-const shortWhy = (reason = '', label = '可能有问题') => {
-  const clean = reason.replace(/\s+/g, ' ').trim();
-  const afterColon = clean.match(/(?:为什么可能错|完整原因|原因|因此|所以)[：:]\s*(.+)$/);
-  if (afterColon?.[1]) return compactLine(afterColon[1], 42);
-  const missing = clean.match(/(?:没有看到|缺少|缺失)[“"]([^”"]+)[”"]/);
-  if (missing?.[1]) return `缺少${missing[1]}`;
-  const outputIssue = clean.match(/当前输出[“"][^”"]+[”"]里没有看到[“"]([^”"]+)[”"]/);
-  if (outputIssue?.[1]) return `输出没有包含${outputIssue[1]}`;
-  const direction = clean.match(/资料方向不完整|不能直接支撑本步结论|没有绑定文件片段|不能直接支撑|漏检|漏掉关键依据/);
-  if (direction?.[0]) return direction[0];
-  return compactLine(clean || label, 42);
+const plainReason = (reason = '') =>
+  reason
+    .replace(/\b(?:when|where|why\/how|why|how)\b[：:]?/gi, '')
+    .replace(/(?:什么时候错|从哪到哪|为什么错|为什么可能错|完整原因|原因)[：:]?/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const shortWhy = (reason = '', label = '这一步需要复核') => {
+  const clean = plainReason(reason);
+  if (!clean) return label;
+
+  const entityDrop = clean.match(/前面有\s*(\d+)\s*个候选，当前无理由漏掉了“([^”"]+)”/);
+  if (entityDrop) return `前面已有 ${entityDrop[1]} 个候选，但这一步漏掉了“${entityDrop[2]}”`;
+
+  const previousExists = clean.match(/前面 Step\s*(\d+)\s*已给出信息，当前 Step\s*(\d+)\s*却说缺少信息/);
+  if (previousExists) return `前面已经给出信息，但这一步又误判为缺失`;
+
+  if (/API|接口|工具|调用失败|错误码|404|403|429|SetLimitExceeded/i.test(clean)) {
+    return '接口或工具调用失败，后续结论没有可靠数据';
+  }
+
+  const missing = clean.match(/(?:没有看到|缺少|缺失|漏掉|没有保留|没有覆盖)[“"]?([^。”";；]+)[”"]?/);
+  if (missing?.[1]) return `缺少 ${compactLine(missing[1], 46)}`;
+
+  const unsupported = clean.match(/(?:没有绑定|没有对应|没有提供)(?:文件片段、日志行或上游证据|可追溯证据|证据|来源)/);
+  if (unsupported) return '结论没有绑定可追溯证据';
+
+  if (/资料方向不完整|不能直接支撑本步结论|检索.*不完整/.test(clean)) {
+    return '找到的资料不能直接支撑这一步结论';
+  }
+
+  if (/约束|限制|必须|不能|不允许|未通过/.test(clean)) {
+    return '没有把关键限制条件逐条核对清楚';
+  }
+
+  const sentence = clean
+    .split(/[。；;!?！？]+/)
+    .map(item => item.trim())
+    .find(item => item.length >= 6 && !/^本步是/.test(item));
+  return compactLine(sentence || clean || label, 72);
 };
 
 type PotentialRisk = NonNullable<DiagnosisStep['potential_risks']>[number];
 
 const shortPotentialWhy = (risk: PotentialRisk) =>
-  compactLine(risk.reason_summary || shortWhy(risk.reason || '', risk.label || risk.failure_type), 54);
+  shortWhy(risk.reason_summary || risk.reason || '', risk.label || risk.failure_type);
 
 const shortStepWhy = (step: DiagnosisStep) =>
-  compactLine(step.failure_reason_summary || shortWhy(step.failure_reason || '', labelOf(step)), 58);
+  shortWhy(step.failure_reason_summary || step.failure_reason || '', labelOf(step));
 
 const buildRiskDetail = (risk: PotentialRisk) => [
   `错误类型：${risk.label || risk.failure_type}`,
@@ -262,6 +301,20 @@ const buildRiskDetail = (risk: PotentialRisk) => [
   `修复建议：`,
   ...(risk.suggested_fixes?.length ? risk.suggested_fixes : risk.suggested_fix ? [risk.suggested_fix] : ['暂无']),
 ].filter(Boolean).join('\n');
+
+const renderDetailLine = (line: string, index: number) => {
+  if (!line.trim()) return <div key={index} className="h-3" />;
+  const labelMatch = line.match(/^([^：:]{1,24}[：:])\s*(.*)$/);
+  if (!labelMatch) {
+    return <div key={index}>{line}</div>;
+  }
+  return (
+    <div key={index}>
+      <span className="text-base font-bold text-red-600">{labelMatch[1]}</span>
+      {labelMatch[2] && <span>{labelMatch[2]}</span>}
+    </div>
+  );
+};
 
 const hasAnyText = (text: string | undefined, terms: string[]) =>
   terms.some(term => (text || '').includes(term));
@@ -644,15 +697,42 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
   ].filter((edge, index, arr) =>
     arr.findIndex(item => item.from_step === edge.from_step && item.to_step === edge.to_step) === index
   );
-  const fixGroups = orderedSteps.map((step, index) => {
+  const fixGroups = orderedSteps.flatMap((step, index) => {
     const isSource = isFailureSourceStep(step);
-    const rawItems = Array.from(new Set([
+    const groups: Array<{
+      kind: 'failure' | 'potential';
+      step: DiagnosisStep;
+      fixes: { category: string; text: string }[];
+      labels: string[];
+      palette: typeof stepPalettes[number];
+    }> = [];
+    const failureItems = Array.from(new Set([
       ...(isSource ? (step.suggested_fix || []) : []),
     ].filter(Boolean)));
-    const labels = Array.from(new Set([
+    const failureLabels = Array.from(new Set([
       ...(isSource ? [labelOf(step)] : []),
     ].filter(Boolean)));
-    return { step, fixes: mergeFixItems(rawItems), labels, palette: stepPalettes[index % stepPalettes.length] };
+    const failureFixes = mergeFixItems(failureItems);
+    if (failureFixes.length) {
+      groups.push({ kind: 'failure', step, fixes: failureFixes, labels: failureLabels, palette: stepPalettes[index % stepPalettes.length] });
+    }
+
+    const potentialItems = Array.from(new Set(
+      (!isContentFailure(step) ? (step.potential_risks || []) : [])
+        .flatMap(risk => risk.suggested_fixes || (risk.suggested_fix ? [risk.suggested_fix] : []))
+        .filter(Boolean)
+    ));
+    const potentialLabels = Array.from(new Set(
+      (!isContentFailure(step) ? [
+        ...(step.potential_issue_tags || []),
+        ...(step.potential_risks || []).map(risk => risk.label || risk.failure_type),
+      ] : []).filter(Boolean)
+    ));
+    const potentialFixes = mergeFixItems(potentialItems);
+    if (potentialFixes.length) {
+      groups.push({ kind: 'potential', step, fixes: potentialFixes, labels: potentialLabels, palette: stepPalettes[index % stepPalettes.length] });
+    }
+    return groups;
   }).filter(group => group.fixes.length > 0);
 
   if (!steps.length) return null;
@@ -934,7 +1014,13 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
         {activeTab === 'auto' && (
           <div className="space-y-3">
             {fixGroups.length ? fixGroups.map(group => (
-              <div key={group.step.id} className={clsx('rounded-lg border p-3 shadow-sm', group.palette.card)}>
+              <div
+                key={`${group.kind}-${group.step.id}`}
+                className={clsx(
+                  'rounded-lg border p-3 shadow-sm',
+                  group.kind === 'failure' ? group.palette.card : 'border-sky-200 bg-sky-50/60'
+                )}
+              >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="font-semibold text-slate-800">
                     Step {group.step.order}: {group.step.name}
@@ -943,7 +1029,13 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
                     {group.labels.length > 0 && (
                       <div className="flex flex-wrap gap-1">
                       {group.labels.slice(0, 3).map(label => (
-                        <span key={label} className={clsx('rounded-full px-2 py-0.5 text-[11px] font-medium ring-1', group.palette.chip)}>
+                        <span
+                          key={label}
+                          className={clsx(
+                            'rounded-full px-2 py-0.5 text-[11px] font-medium ring-1',
+                            group.kind === 'failure' ? group.palette.chip : 'bg-sky-100 text-sky-700 ring-sky-200'
+                          )}
+                        >
                           {label}
                         </span>
                       ))}
@@ -962,16 +1054,33 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
                   </div>
                 </div>
                 <div className="mt-2 rounded-md bg-white/70 px-2 py-1.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-100">
-                  错误源头：建议改 Step {group.step.order}
-                  {group.step.affected_steps?.length
-                    ? `，该错误会继续影响 Step ${group.step.affected_steps.join('、Step ')}`
-                    : group.step.where_to_steps?.length
-                      ? `，它的输出会进入 Step ${group.step.where_to_steps.join('、Step ')}`
-                      : '，这是当前可定位到的直接错误位置'}
+                  {group.kind === 'failure' ? (
+                    <>
+                      错误源头：建议改 Step {group.step.order}
+                      {group.step.affected_steps?.length
+                        ? `，该错误会继续影响 Step ${group.step.affected_steps.join('、Step ')}`
+                        : group.step.where_to_steps?.length
+                          ? `，它的输出会进入 Step ${group.step.where_to_steps.join('、Step ')}`
+                          : '，这是当前可定位到的直接错误位置'}
+                    </>
+                  ) : (
+                    <>
+                      可能需要修复：建议检查 Step {group.step.order}
+                      {group.step.where_to_steps?.length
+                        ? `，它的输出后续会进入 Step ${group.step.where_to_steps.join('、Step ')}`
+                        : '，目前还不是确定错误源'}
+                    </>
+                  )}
                 </div>
                 <div className="mt-2 space-y-2">
                   {group.fixes.map((fix) => (
-                    <div key={fix.category} className={clsx('rounded-md px-3 py-2 text-xs leading-5 text-slate-700 ring-1', group.palette.item)}>
+                    <div
+                      key={fix.category}
+                      className={clsx(
+                        'rounded-md px-3 py-2 text-xs leading-5 text-slate-700 ring-1',
+                        group.kind === 'failure' ? group.palette.item : 'bg-white/80 ring-sky-100'
+                      )}
+                    >
                       <span className="font-semibold text-slate-600">{fix.category}： </span>{fix.text}
                     </div>
                   ))}
@@ -994,7 +1103,7 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 px-6 py-8">
           <div className="flex max-h-full w-full max-w-3xl flex-col rounded-xl border border-slate-200 bg-white shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
-              <div className="text-sm font-semibold text-slate-800">{detailModal.title}</div>
+              <div className="text-xl font-bold text-red-600">{detailModal.title}</div>
               <button
                 type="button"
                 onClick={() => setDetailModal(null)}
@@ -1003,9 +1112,9 @@ export function AgentDiagnosisPanel({ steps, traceDiagnosis, currentQuestion, on
                 关闭
               </button>
             </div>
-            <pre className="max-h-[70vh] overflow-y-auto whitespace-pre-wrap p-5 font-sans text-sm leading-6 text-slate-700">
-              {detailModal.content}
-            </pre>
+            <div className="max-h-[70vh] overflow-y-auto whitespace-pre-wrap p-5 font-sans text-sm leading-7 text-slate-700">
+              {detailModal.content.split('\n').map(renderDetailLine)}
+            </div>
           </div>
         </div>
       )}

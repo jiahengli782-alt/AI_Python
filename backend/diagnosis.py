@@ -277,7 +277,16 @@ def compact_snippet(text: str, max_len: int = 140) -> str:
     clean = re.sub(r"\s+", " ", text or "").strip()
     if len(clean) <= max_len:
         return clean
-    return clean[:max_len - 3] + "..."
+    cut = clean[:max_len]
+    boundary = max(
+        cut.rfind("。"),
+        cut.rfind("；"),
+        cut.rfind("，"),
+        cut.rfind(";"),
+        cut.rfind(","),
+        cut.rfind(" ")
+    )
+    return cut[:boundary].strip() if boundary >= max(24, max_len // 2) else cut.strip()
 
 
 def extract_key_terms(text: str, limit: int = 6) -> List[str]:
@@ -341,12 +350,12 @@ def missing_evidence_requirements(full_text: str, step_text: str, stage: str) ->
         missing.append("上线状态证据")
     if "功能" in full_text and not re.search(r"(功能|模块|服务|能力|作用)", output_like):
         missing.append("功能名称及作用依据")
-    if contains_any(full_text, ["when", "什么时候", "时间", "发生"]) and not re.search(r"(时间|日期|阶段|发生|when|\d{4}[-/年])", output_like, re.I):
-        missing.append("when/发生时间")
-    if contains_any(full_text, ["where", "哪里", "位置", "到哪里", "在哪"]) and not re.search(r"(位置|接口|模块|页面|步骤|where|到\s*Step|来源)", output_like, re.I):
-        missing.append("where/发生位置")
-    if contains_any(full_text, ["why", "为什么", "原因"]) and stage in {"generator", "summarizer", "verifier"} and not re.search(r"(因为|原因|导致|依据|why|证据)", output_like, re.I):
-        missing.append("why/原因证据")
+    if contains_any(full_text, ["when", "什么时候", "时间", "发生"]) and not re.search(r"(时间|日期|阶段|发生|\d{4}[-/年])", output_like, re.I):
+        missing.append("发生时间或日期依据")
+    if contains_any(full_text, ["where", "哪里", "位置", "到哪里", "在哪"]) and not re.search(r"(位置|接口|模块|页面|步骤|到\s*Step|来源)", output_like, re.I):
+        missing.append("发生位置或对应模块")
+    if contains_any(full_text, ["why", "为什么", "原因"]) and stage in {"generator", "summarizer", "verifier"} and not re.search(r"(因为|原因|导致|依据|证据)", output_like, re.I):
+        missing.append("原因依据")
     return list(dict.fromkeys(missing))[:4]
 
 
@@ -1446,10 +1455,10 @@ def diagnose_trace(steps: List[Dict[str, Any]]) -> Dict[str, Any]:
         "main_failure_label": strongest.get("failure_label", FAILURE_TYPES["unknown"]),
         "failure_stage": first_failure.get("step_id"),
         "summary": (
-            f"When: 最早内容错误源出现在 Step {first_failure.get('step_id')}（{first_failure.get('stage_label')}）。"
-            f" Where: 来源为 {', '.join(first_failure.get('source_refs') or [])}，"
-            f"实际影响后续 {first_failure.get('affected_steps') or '暂无明确下游使用'}。"
-            f" Why/How: {first_failure.get('failure_reason')}"
+            f"最早能定位到的问题出现在 Step {first_failure.get('step_id')}（{first_failure.get('stage_label')}）。"
+            f"它的依据来自 {', '.join(first_failure.get('source_refs') or ['当前步骤输入/输出'])}，"
+            f"可能影响后续 {first_failure.get('affected_steps') or '暂无明确下游使用'}。"
+            f"主要原因是：{first_failure.get('failure_reason_summary') or first_failure.get('failure_reason')}"
         ),
         "suggested_fixes": fixes[:6],
         "propagation_edges": propagation,
